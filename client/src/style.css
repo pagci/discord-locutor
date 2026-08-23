@@ -334,6 +334,127 @@ body {
   stroke-linecap: round;
 }
 
+/* ---------------------------------------------------------------- zoom */
+
+/* Só no palco: aparece ao passar o mouse ou enquanto houver zoom, para não
+   sujar a imagem parada. No topo ao centro — os cantos já são do "você", da
+   marca de fonte e do botão de parar. */
+.zoom-controls {
+  position: absolute;
+  top: 8px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 3;
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 3px;
+  border-radius: 999px;
+  background: rgba(0, 0, 0, 0.6);
+  backdrop-filter: blur(4px);
+  opacity: 0;
+  transition: opacity 0.15s;
+}
+
+.tile-palco:hover .zoom-controls,
+.tile-palco.tem-zoom .zoom-controls {
+  opacity: 1;
+}
+
+.zoom-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  color: #fff;
+  font: 500 16px/1 inherit;
+  cursor: pointer;
+  transition: background 0.12s;
+}
+
+.zoom-btn:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.18);
+}
+
+.zoom-btn:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+
+.zoom-reset {
+  font-size: 15px;
+}
+
+.zoom-nivel {
+  min-width: 44px;
+  text-align: center;
+  color: #fff;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  user-select: none;
+}
+
+/* Com zoom, o palco vira superfície de arrasto. */
+.tile-palco.tem-zoom {
+  cursor: grab;
+}
+
+.tile-palco.arrastando {
+  cursor: grabbing;
+}
+
+/* -------------------------------------------- parar a própria transmissão */
+
+/* Canto de cima à direita — o lugar de "você", que numa transmissão minha dá
+   vez ao controle de encerrá-la. Sempre visível, porque é controle e não
+   enfeite; fecha em vermelho no hover. Uma por tela: é assim que se para uma
+   das várias telas sem tocar nas outras. */
+.tile-untransmit {
+  position: absolute;
+  right: 8px;
+  top: 8px;
+  z-index: 3;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: rgba(0, 0, 0, 0.6);
+  color: #fff;
+  opacity: 0.85;
+  cursor: pointer;
+  transition: opacity 0.15s, background 0.15s;
+}
+
+.tile:hover .tile-untransmit {
+  opacity: 1;
+}
+
+.tile-untransmit:hover {
+  background: var(--danger);
+}
+
+.tile-untransmit svg {
+  width: 14px;
+  height: 14px;
+  fill: currentColor;
+}
+
+.sidebar .tile-untransmit {
+  width: 24px;
+  height: 24px;
+  right: 5px;
+  top: 5px;
+}
+
 /* ---------------------------------------------- espera do primeiro quadro */
 
 /* Cobre o canvas enquanto ele ainda é preto. pointer-events: none para não

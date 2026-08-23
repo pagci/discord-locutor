@@ -16,18 +16,38 @@
  */
 import crypto from 'node:crypto';
 
-const MAX_BROADCASTERS = 4;
-// Duas por pessoa: a tela e a câmera. O teto da sala continua valendo por cima,
-// então duas pessoas com as duas fontes já lotam.
-const MAX_POR_PESSOA = 2;
+const MAX_BROADCASTERS = 6;
+// O teto por pessoa acompanha o da sala: uma pessoa pode encher a sala só de
+// telas suas. O teto da sala continua valendo por cima, então quem passar disso
+// é barrado pela contagem total, não por uma cota individual.
+const MAX_POR_PESSOA = MAX_BROADCASTERS;
+// Telas por pessoa. Além da primeira ('tela'), as seguintes ganham sufixo
+// ('tela-2'…'tela-N'), e é o sufixo que dá a cada uma uma chave própria.
+const MAX_TELAS = MAX_BROADCASTERS;
 
 // Identidade de espectador na sinalização WebRTC. O transmissor precisa de um
 // nome para endereçar cada conexão direta, e o id do usuário não serve: a mesma
 // pessoa pode ter duas abas assistindo, e cada aba é uma conexão diferente.
 let proximoPeerId = 1;
 
-/** As fontes que uma transmissão pode ter. */
+/** As fontes-base que uma transmissão pode ter. Telas extras usam 'tela-N'. */
 export const FONTES = new Set(['tela', 'camera']);
+
+/** Toda fonte que não é câmera é tela — a primeira ou uma das numeradas. */
+export const ehCamera = (fonte) => fonte === 'camera';
+
+/**
+ * A fonte é aceitável?
+ *
+ * 'camera' e 'tela' são as duas bases; 'tela-2'…'tela-N' são as telas extras.
+ * O número tem teto para um cliente adulterado não pedir slots infinitos — a
+ * validação de identidade não passa por aqui, mas a de forma sim.
+ */
+export function fonteValida(fonte) {
+  if (fonte === 'camera' || fonte === 'tela') return true;
+  const m = /^tela-(\d+)$/.exec(fonte);
+  return Boolean(m) && Number(m[1]) >= 2 && Number(m[1]) <= MAX_TELAS;
+}
 // Sala é objeto em memória criado por qualquer pessoa autenticada: sem teto,
 // um laço de "criar sala" consome a RAM do processo.
 const MAX_ROOMS_PER_INSTANCE = 20;

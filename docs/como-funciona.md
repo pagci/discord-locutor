@@ -117,7 +117,9 @@ Cada pacote trafega como binário puro:
 
 O `slot` é o número do transmissor, carimbado na origem: o servidor repassa o
 buffer sem tocar nele, e quem assiste sabe para qual decodificador mandar. Até
-4 transmissores por sala.
+6 transmissores por sala, e uma mesma pessoa pode ocupar vários deles — cada
+tela extra que ela compartilha entra num slot próprio, com a fonte `tela-2`,
+`tela-3`… distinguindo uma da outra.
 
 O relógio de envio serve só para medir atraso. É exato na mesma máquina; entre
 máquinas diferentes, aproximado.
