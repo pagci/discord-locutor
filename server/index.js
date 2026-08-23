@@ -10,7 +10,7 @@ import { WebSocketServer } from 'ws';
 import { signToken, verifyToken } from './tokens.js';
 import * as R from './rooms.js';
 import { systemSnapshot, startSampling } from './system.js';
-import { buildAdminDashboard } from './admin.js';
+import { buildAdminDashboard, mergeAdminDashboards } from './admin.js';
 import { basePathFor, nodeFor, shardKey, stripNode } from '../shared/shard.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -1024,8 +1024,9 @@ app.post('/api/admin/logout', (_req, res) => {
   res.json({ ok: true });
 });
 
-app.get('/api/admin/metrics', requireAdmin, (_req, res) => {
-  const dashboard = buildAdminDashboard({
+/** O painel desta máquina, sem perguntar a ninguém. */
+const painelLocal = () =>
+  buildAdminDashboard({
     roomState: R.adminStats(),
     sockets: wss.clients,
     system: systemSnapshot(),
@@ -1037,9 +1038,78 @@ app.get('/api/admin/metrics', requireAdmin, (_req, res) => {
       botConfigured: Boolean(DISCORD_BOT_TOKEN),
       adminIds: [...ADMIN_IDS],
       sessionSecretConfigured: Boolean(process.env.SESSION_SECRET),
+      node: EU,
+      nodes: NOS,
     },
   });
-  res.json(dashboard);
+
+/**
+ * O painel desta máquina, para as outras máquinas do conjunto.
+ *
+ * Existe porque o cookie do painel é gravado no domínio de entrada e não é
+ * enviado para os subdomínios — o navegador não consegue perguntar de máquina
+ * em máquina sem um login em cada uma. Então quem pergunta é o servidor, e a
+ * porta de entrada dele é esta, autenticada pelo segredo que as máquinas já
+ * compartilham.
+ *
+ * Ela nunca pergunta a ninguém: é o que impede um leque virar recursão.
+ */
+app.get('/api/admin/local', (req, res) => {
+  const token = verifyToken(String(req.headers.authorization ?? '').replace(/^Bearer /, ''));
+  if (!FATIADO || token?.scope !== 'interno') return res.status(404).end();
+
+  res.setHeader('Cache-Control', 'no-store');
+  res.json(painelLocal());
+});
+
+// O leque custa uma ida a cada máquina. Dois admins com o painel aberto
+// dobrariam isso sem necessidade — e o valor de um segundo atrás responde a
+// mesma pergunta.
+let painelCache = { quando: 0, valor: null };
+const CACHE_PAINEL_MS = 1000;
+
+/**
+ * Pergunta o painel a uma máquina irmã. Nunca lança: máquina que não responde
+ * vira uma linha `offline` no resultado, em vez de derrubar o painel inteiro.
+ */
+async function painelDe(index) {
+  try {
+    const r = await fetch(`${origemDoNo(index)}/n${index}/api/admin/local`, {
+      headers: { Authorization: `Bearer ${signToken({ scope: 'interno' }, 60)}` },
+      signal: AbortSignal.timeout(2500),
+    });
+    if (!r.ok) return { index, origin: origemDoNo(index), online: false, dashboard: null };
+    return { index, origin: origemDoNo(index), online: true, dashboard: await r.json() };
+  } catch {
+    return { index, origin: origemDoNo(index), online: false, dashboard: null };
+  }
+}
+
+app.get('/api/admin/metrics', requireAdmin, async (_req, res) => {
+  res.setHeader('Cache-Control', 'no-store');
+
+  // Uma máquina só: nada a juntar, nada a perguntar.
+  if (!FATIADO) return res.json(painelLocal());
+
+  if (Date.now() - painelCache.quando < CACHE_PAINEL_MS && painelCache.valor) {
+    return res.json(painelCache.valor);
+  }
+
+  // A própria primeiro: é dela a configuração e o `system` que sobem ao topo,
+  // e ela é a única que com certeza responde.
+  const eu = { index: EU, origin: origemDoNo(EU), online: true, dashboard: painelLocal() };
+  const outras = await Promise.all(
+    Array.from({ length: NOS }, (_, i) => i)
+      .filter((i) => i !== EU)
+      .map(painelDe),
+  );
+
+  // Sem ordenar: a junção usa a primeira da lista como base, e tem de ser a
+  // que atendeu — é dela a configuração e o `system` que sobem ao topo. A
+  // ordem por índice é reposta dentro da junção, só na quebra por máquina.
+  const juntado = mergeAdminDashboards([eu, ...outras]);
+  painelCache = { quando: Date.now(), valor: juntado };
+  res.json(juntado);
 });
 
 /**

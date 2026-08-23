@@ -5,7 +5,7 @@
  * salas é um servidor.
  */
 import { describe, expect, it } from 'vitest';
-import { buildAdminDashboard } from './admin.js';
+import { buildAdminDashboard, mergeAdminDashboards } from './admin.js';
 
 function trafego(recebido = 0, transmitido = 0) {
   return {
@@ -219,5 +219,119 @@ describe('buildAdminDashboard', () => {
       broadcasterConnections: 3,
       rooms: 2,
     });
+  });
+});
+
+/**
+ * A junção de várias máquinas num painel só.
+ *
+ * O que se prova aqui é o que não se enxerga olhando a tela: que a mesma
+ * pessoa em duas máquinas continua sendo uma pessoa, que o mesmo servidor
+ * visto de dois lugares continua sendo um servidor, e que máquina calada não
+ * derruba o painel. Errar qualquer um desses faz o total mentir — e um total
+ * que mente é pior que nenhum, porque ninguém desconfia dele.
+ */
+const parte = (index, dashboard, online = true) => ({
+  index,
+  origin: `https://n${index}.teste`,
+  online,
+  dashboard,
+});
+
+describe('mergeAdminDashboards', () => {
+  it('soma salas e transmissões das máquinas, marcando de quem é cada uma', () => {
+    const a = montar([sala('a1'), sala('a2')]);
+    const b = montar([sala('b1')]);
+
+    const junto = mergeAdminDashboards([parte(0, a), parte(1, b)]);
+
+    expect(junto.summary.rooms).toBe(3);
+    expect(junto.rooms.map((r) => r.id).sort()).toEqual(['a1', 'a2', 'b1']);
+    expect(junto.rooms.find((r) => r.id === 'b1').node).toBe(1);
+  });
+
+  it('a mesma pessoa em duas máquinas conta como uma', () => {
+    // Acontece de verdade: duas calls da mesma pessoa caem em máquinas
+    // diferentes porque o sorteio é por canal.
+    const a = montar([sala('a1', { users: [usuario('u1')] })]);
+    const b = montar([sala('b1', { users: [usuario('u1')] })]);
+
+    const junto = mergeAdminDashboards([parte(0, a), parte(1, b)]);
+
+    expect(junto.summary.users).toBe(1);
+    expect(junto.users).toHaveLength(1);
+    // Mas as conexões dela somam: são duas de verdade.
+    expect(junto.users[0].connections).toBe(2);
+    expect(junto.users[0].rooms.sort()).toEqual(['a1', 'b1']);
+    expect(junto.users[0].nodes).toEqual([0, 1]);
+  });
+
+  it('o mesmo servidor visto de duas máquinas é um servidor', () => {
+    const guild = { guildId: 'g1', guildName: 'Servidor' };
+    const a = montar([sala('a1', { ...guild, users: [usuario('u1')] })]);
+    const b = montar([sala('b1', { ...guild, users: [usuario('u2')] })]);
+
+    const junto = mergeAdminDashboards([parte(0, a), parte(1, b)]);
+
+    expect(junto.summary.guilds).toBe(1);
+    expect(junto.guilds[0].rooms).toBe(2);
+    expect(junto.guilds[0].users).toBe(2);
+  });
+
+  it('não conta duas vezes quem está no mesmo servidor em duas máquinas', () => {
+    const guild = { guildId: 'g1', guildName: 'Servidor' };
+    const a = montar([sala('a1', { ...guild, users: [usuario('u1')] })]);
+    const b = montar([sala('b1', { ...guild, users: [usuario('u1')] })]);
+
+    const junto = mergeAdminDashboards([parte(0, a), parte(1, b)]);
+
+    expect(junto.guilds[0].users).toBe(1);
+  });
+
+  it('soma o tráfego das máquinas', () => {
+    const junto = mergeAdminDashboards([parte(0, montar([])), parte(1, montar([]))]);
+
+    // Cada painel de teste reporta 10 recebidos e 20 transmitidos.
+    expect(junto.traffic.receivedBytes).toBe(20);
+    expect(junto.traffic.transmittedBytes).toBe(40);
+  });
+
+  it('máquina calada não derruba o painel, e aparece como offline', () => {
+    const a = montar([sala('a1')]);
+
+    const junto = mergeAdminDashboards([parte(0, a), parte(1, null, false)]);
+
+    expect(junto.summary.rooms).toBe(1);
+    expect(junto.nodes).toHaveLength(2);
+    expect(junto.nodes[1]).toMatchObject({ index: 1, online: false, summary: null });
+  });
+
+  it('não inventa mediana nem p95 no total', () => {
+    // Elas não se calculam a partir das medianas de cada máquina: seria preciso
+    // a lista de pings de todas. Responder null é mais honesto que responder um
+    // número que parece certo.
+    const junto = mergeAdminDashboards([parte(0, montar([])), parte(1, montar([]))]);
+
+    expect(junto.summary.pingMedianMs).toBeNull();
+    expect(junto.summary.pingP95Ms).toBeNull();
+  });
+
+  it('a quebra por máquina sai em ordem, não na ordem de quem atendeu', () => {
+    // A máquina que atendeu vem primeiro na entrada, porque é dela a base. Se
+    // essa ordem vazasse para a saída, as linhas do painel dançariam a cada
+    // atualização — exatamente o defeito que a junção veio corrigir.
+    const junto = mergeAdminDashboards([
+      parte(2, montar([])),
+      parte(0, montar([])),
+      parte(1, montar([])),
+    ]);
+
+    expect(junto.nodes.map((n) => n.index)).toEqual([0, 1, 2]);
+  });
+
+  it('mantém a configuração de quem atendeu', () => {
+    const junto = mergeAdminDashboards([parte(1, montar([])), parte(0, montar([]))]);
+
+    expect(junto.configuration).toEqual({ discord: true });
   });
 });

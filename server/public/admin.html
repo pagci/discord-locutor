@@ -19,12 +19,8 @@
       <div class="center-inner">
         <div class="mark" aria-hidden="true">ST</div>
         <h1>Painel da Sala de Tela</h1>
-        <p id="loginMessage" class="muted">
-          Entre com a conta do Discord autorizada.
-        </p>
-        <a id="loginButton" class="btn btn-brand" href="/admin/auth/login">
-          Entrar com Discord
-        </a>
+        <p id="loginMessage" class="muted">Entre com a conta do Discord autorizada.</p>
+        <a id="loginButton" class="btn btn-brand" href="/admin/auth/login"> Entrar com Discord </a>
       </div>
     </main>
 
@@ -44,7 +40,14 @@
           <img id="adminAvatar" alt="" hidden />
           <span id="adminName"></span>
         </span>
-        <button id="refresh" class="btn btn-icon" title="Atualizar agora" aria-label="Atualizar agora">↻</button>
+        <button
+          id="refresh"
+          class="btn btn-icon"
+          title="Atualizar agora"
+          aria-label="Atualizar agora"
+        >
+          ↻
+        </button>
         <button id="logout" class="btn">Sair</button>
       </header>
 
@@ -90,6 +93,34 @@
             </div>
           </div>
           <canvas id="chart" class="chart"></canvas>
+        </section>
+
+        <!--
+          Só aparece quando há mais de uma máquina. Os números do topo já são o
+          total somado; esta tabela é a quebra — sem ela não dá para saber se a
+          carga está dividida ou se uma máquina está levando tudo.
+        -->
+        <section id="nodesPanel" class="card panel" aria-labelledby="nodesTitle" hidden>
+          <div class="panel-head">
+            <h2 id="nodesTitle">Máquinas</h2>
+            <div class="spacer"></div>
+            <span id="nodesCount" class="badge">0</span>
+          </div>
+          <div class="table-scroll">
+            <table>
+              <thead>
+                <tr>
+                  <th>Máquina</th>
+                  <th>Pessoas</th>
+                  <th>Salas</th>
+                  <th>Transmissões</th>
+                  <th>Banda</th>
+                  <th>Ping</th>
+                </tr>
+              </thead>
+              <tbody id="nodesBody"></tbody>
+            </table>
+          </div>
         </section>
 
         <section class="card panel" aria-labelledby="peopleTitle">

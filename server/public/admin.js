@@ -159,6 +159,7 @@ function render(data) {
   );
 
   renderPeople(data);
+  renderMaquinas(data.nodes);
   renderRecursos(data.system);
   renderAmbiente(data);
 
@@ -237,6 +238,78 @@ function celula(linha, principal, secundaria = null) {
 }
 
 // ------------------------------------------------------- recursos e ambiente
+
+/**
+ * A quebra por máquina.
+ *
+ * Os números do topo já vêm somados de todas — esta tabela responde a outra
+ * pergunta, que o total esconde: a carga está dividida, ou uma máquina está
+ * levando tudo? Sem ela, cinco máquinas parecem uma.
+ *
+ * Some quando só existe uma máquina: aí não há divisão sobre a qual falar, e a
+ * tabela seria uma linha repetindo o topo.
+ */
+function renderMaquinas(nodes) {
+  const painel = $('nodesPanel');
+  if (!painel) return;
+
+  painel.hidden = !Array.isArray(nodes) || nodes.length < 2;
+  if (painel.hidden) return;
+
+  text('nodesCount', String(nodes.filter((n) => n.online).length));
+
+  $('nodesBody').replaceChildren(
+    ...nodes.map((node) => {
+      const tr = document.createElement('tr');
+
+      const nome = document.createElement('td');
+      // O host, e não só o número: é ele que você procura no painel da
+      // hospedagem quando uma linha está estranha.
+      nome.textContent = `n${node.index} · ${hostDe(node.origin)}`;
+      if (!node.online) nome.classList.add('warn');
+      tr.append(nome);
+
+      if (!node.online) {
+        const fora = document.createElement('td');
+        fora.colSpan = 5;
+        fora.className = 'warn';
+        fora.textContent = 'não respondeu';
+        tr.append(fora);
+        return tr;
+      }
+
+      const banda =
+        (node.traffic?.receivedBytesPerSecond ?? 0) +
+        (node.traffic?.transmittedBytesPerSecond ?? 0);
+
+      for (const valor of [
+        String(node.summary.users),
+        String(node.summary.rooms),
+        String(node.summary.streams),
+        formatRate(banda),
+        formatMs(node.summary.pingAverageMs),
+      ]) {
+        const td = document.createElement('td');
+        // Mesma classe que a coluna de ping da tabela de pessoas usa: number
+        // alinhado à direita é o que deixa comparar duas linhas de relance, que
+        // é a única coisa que se faz nesta tabela.
+        td.className = 'num';
+        td.textContent = valor;
+        tr.append(td);
+      }
+
+      return tr;
+    }),
+  );
+}
+
+function hostDe(origin) {
+  try {
+    return new URL(origin).host;
+  } catch {
+    return origin ?? '—';
+  }
+}
 
 function renderRecursos(system) {
   const memoriaUsada = system.memory.hostTotalBytes - system.memory.hostFreeBytes;
