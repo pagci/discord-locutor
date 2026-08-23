@@ -5,11 +5,10 @@
  * iframe da Activity, a transmissão precisa nascer numa página top-level, onde
  * getDisplayMedia funciona sem restrição.
  *
- * Uma página, N conexões. Cada tela e a câmera são painéis independentes, cada
- * um com sua própria conexão e seu próprio ligar/desligar — abrir uma aba por
- * fonte multiplicaria as janelas que a pessoa precisa manter vivas, e nenhuma
- * delas pode ser fechada enquanto transmite. A câmera é fixa na página; as telas
- * nascem de um molde, uma por tela compartilhada.
+ * Uma página, duas fontes. Tela e câmera são painéis independentes, cada um com
+ * sua própria conexão e seu próprio ligar/desligar — abrir uma aba por fonte
+ * dobraria as janelas que a pessoa precisa manter vivas, e nenhuma delas pode
+ * ser fechada enquanto transmite.
  *
  * Toda a lógica de captura e codificação vive em /shared/broadcaster.js, a mesma
  * usada dentro da Activity — aqui é só a interface.
@@ -26,18 +25,8 @@ const $ = (id) => document.getElementById(id);
 const query = new URLSearchParams(location.search);
 const token = query.get('t');
 
-// Espelha o teto do servidor (rooms.js MAX_TELAS): esta lista é a ordem e o
-// número máximo de telas por pessoa.
-const FONTES_TELA = ['tela', 'tela-2', 'tela-3', 'tela-4', 'tela-5', 'tela-6'];
+const FONTES = ['tela', 'camera'];
 const TITULO = document.title;
-
-const ehCamera = (fonte) => fonte === 'camera';
-const numeroDaTela = (fonte) =>
-  fonte === 'tela' ? 1 : Number(/^tela-(\d+)$/.exec(fonte ?? '')?.[1] ?? 0);
-
-// Todos os painéis vivos, por fonte: 'camera', 'tela', 'tela-2'…
-const paineis = new Map();
-const todos = () => [...paineis.values()];
 
 /**
  * As opções da transmissão.
@@ -100,8 +89,10 @@ function mudarOpcao(chave, valor) {
   if (!Number(valor)) return;
   opcoes[chave] = Number(valor);
   guardar();
-  for (const painel of todos()) painel.aplicarQualidade();
+  for (const painel of Object.values(paineis)) painel?.aplicarQualidade?.();
 }
+
+const paineis = {};
 
 function readTokenPayload() {
   try {
@@ -112,7 +103,7 @@ function readTokenPayload() {
 }
 
 function falhar(titulo, msg) {
-  $('fontes').hidden = true;
+  for (const f of FONTES) $(`bloco-${f}`).hidden = true;
   // Título e motivo no mesmo lugar: sem o cabeçalho não há mais onde separar
   // os dois, e separados em duas linhas eles diziam a mesma coisa duas vezes.
   const el = $('pageStatus');
@@ -133,7 +124,7 @@ let piscando = null;
  * aparece para quem está olhando outra coisa.
  */
 function chamar(fonte) {
-  for (const [f, painel] of paineis) painel.root.classList.toggle('chamando', f === fonte);
+  for (const f of FONTES) $(`bloco-${f}`).classList.toggle('chamando', f === fonte);
 
   clearInterval(piscando);
   piscando = null;
@@ -144,7 +135,7 @@ function chamar(fonte) {
   // no bloco já diz qual é.
   if (!document.hidden) return;
 
-  const aviso = ehCamera(fonte) ? '● Ligar a câmera' : '● Compartilhar a tela';
+  const aviso = fonte === 'camera' ? '● Ligar a câmera' : '● Compartilhar a tela';
   let ligado = false;
   piscando = setInterval(() => {
     ligado = !ligado;
@@ -168,7 +159,7 @@ document.addEventListener('visibilitychange', () => {
  */
 function aplicarConfig(novas) {
   aplicarOpcoes(novas);
-  for (const painel of todos()) painel.aplicarQualidade();
+  for (const f of FONTES) paineis[f]?.aplicarQualidade();
 }
 
 /**
@@ -180,17 +171,16 @@ function aplicarConfig(novas) {
  *
  * Tela não abre nem em prévia: `getDisplayMedia` exige ativação transitória e
  * lança InvalidStateError sem ela, então o seletor só nasce de um clique nesta
- * página. O que resta é chamar e esperar. Uma tela numerada que ainda não tem
- * bloco ganha um agora — é assim que a atividade pede a segunda, a terceira…
+ * página. O que resta é chamar e esperar.
  */
 function atenderPedido(fonte, novas) {
   aplicarOpcoes(novas);
 
-  const painel = ehCamera(fonte) ? paineis.get('camera') : garantirTela(fonte);
+  const painel = paineis[fonte];
   if (!painel || painel.ativo() || painel.indisponivel()) return;
 
   chamar(fonte);
-  if (ehCamera(fonte)) painel.verCamera();
+  if (fonte === 'camera') painel.verCamera();
 }
 
 // --------------------------------------------------------------- controle
@@ -246,15 +236,9 @@ function ligarControle() {
 
 // ------------------------------------------------------------------ painel
 
-/**
- * Um painel de fonte, preso a um `root` no DOM.
- *
- * `el` resolve os elementos dentro do próprio root, por classe: é o que deixa a
- * mesma marcação servir a várias telas ao mesmo tempo sem colisão de id.
- */
-function criarPainel(fonte, root) {
-  const el = (sufixo) => root.querySelector(`.js-${sufixo}`);
-  const camera = ehCamera(fonte);
+function criarPainel(fonte) {
+  const el = (sufixo) => $(`${fonte}-${sufixo}`);
+  const camera = fonte === 'camera';
 
   let broadcaster = null;
 
@@ -356,7 +340,6 @@ function criarPainel(fonte, root) {
   }
 
   function fecharMenu() {
-    if (!el('menu')) return;
     el('menu').hidden = true;
     el('escolher').setAttribute('aria-expanded', 'false');
   }
@@ -458,7 +441,6 @@ function criarPainel(fonte, root) {
         broadcaster = null;
         mostrarSetup();
         setStatus(reason);
-        atualizarAddTela();
       },
     });
 
@@ -479,9 +461,8 @@ function criarPainel(fonte, root) {
       el('live').hidden = false;
       // A tela sempre pede som, e a caixa do seletor pode ter ficado desmarcada:
       // a saída fica à mão desde o início, em vez de só depois de um aviso.
-      if (!camera) el('somAba').hidden = false;
+      if (!camera) $('somAba').hidden = false;
       chamar(null);
-      atualizarAddTela();
     } catch (err) {
       broadcaster = null;
       el('start').disabled = false;
@@ -515,22 +496,6 @@ function criarPainel(fonte, root) {
     escolher().catch((err) => setStatus(err.message, 'error'));
   });
 
-  // O som de tela pode vir de outra fonte que não carrega o Discord junto — uma
-  // aba ou a janela de um aplicativo. Mantém o vídeo e troca só de onde vem o som.
-  if (!camera) {
-    el('somAba').addEventListener('click', async () => {
-      if (!broadcaster) return;
-      try {
-        await broadcaster.trocarSom();
-        setStatus('Som ligado, vindo da fonte escolhida.', 'ok');
-        el('somAba').textContent = 'Trocar a fonte do som';
-      } catch (err) {
-        // Cancelar a segunda janela é escolha, não falha.
-        if (err.name !== 'NotAllowedError') setStatus(err.message, 'error');
-      }
-    });
-  }
-
   if (camera) {
     document.addEventListener('click', fecharMenu);
     document.addEventListener('keydown', (e) => {
@@ -539,8 +504,6 @@ function criarPainel(fonte, root) {
   }
 
   return {
-    fonte,
-    root,
     ligar,
     escolher,
     verCamera,
@@ -553,51 +516,9 @@ function criarPainel(fonte, root) {
       broadcaster?.stop();
       pararPrevia();
     },
+    trocarSom: () => broadcaster?.trocarSom(),
   };
 }
-
-// --------------------------------------------------------------- telas
-
-const tpl = $('tpl-tela');
-
-/** Cria (ou reencontra) o bloco de uma tela, clonando o molde. */
-function garantirTela(fonte) {
-  const existente = paineis.get(fonte);
-  if (existente) return existente;
-  if (!FONTES_TELA.includes(fonte)) return null;
-
-  const frag = tpl.content.cloneNode(true);
-  const root = frag.querySelector('.bloco-tela');
-  const numero = numeroDaTela(fonte);
-  root.querySelector('.js-titulo').textContent = numero > 1 ? `Tela ${numero}` : 'Tela';
-  // Antes da câmera, para as telas virem primeiro; o botão de adicionar fica
-  // sempre por último, empurrado pela ordem do DOM.
-  $('fontes').insertBefore(root, $('bloco-camera'));
-
-  const painel = criarPainel(fonte, root);
-  paineis.set(fonte, painel);
-  atualizarAddTela();
-  return painel;
-}
-
-/** A próxima fonte de tela sem transmissão no ar, ou null no teto. */
-function proximaTelaLivre() {
-  return FONTES_TELA.find((f) => !paineis.get(f)?.ativo()) ?? null;
-}
-
-/** Mostra ou esconde o "+ outra tela" conforme ainda cabe outra. */
-function atualizarAddTela() {
-  const cabe = Boolean(proximaTelaLivre()) && !fonteIndisponivel('tela');
-  $('addTela').hidden = !cabe;
-}
-
-$('addTela').addEventListener('click', () => {
-  const fonte = proximaTelaLivre();
-  if (!fonte) return;
-  // O clique é o gesto que o seletor de tela exige: dá para abrir a escolha
-  // agora mesmo, sem esperar um segundo clique no bloco recém-criado.
-  garantirTela(fonte)?.escolher();
-});
 
 // ------------------------------------------------------------------ arranque
 
@@ -613,24 +534,35 @@ if (!payload) {
 } else if (missing) {
   falhar('Navegador sem suporte.', missing);
 } else {
-  paineis.set('camera', criarPainel('camera', $('bloco-camera')));
-  // A primeira tela sempre existe: a página nunca abre sem nada para mostrar.
-  garantirTela('tela');
+  for (const f of FONTES) paineis[f] = criarPainel(f);
   ligarControle();
-  atualizarAddTela();
 
   // A atividade diz qual fonte motivou a abertura da aba. A tela espera o
   // clique, que é o gesto que o seletor exige; a câmera abre a prévia, mas só
   // depois que a página apareceu — pedir permissão numa aba que o navegador
   // acabou de abrir em segundo plano deixaria o pedido preso sem ninguém ver.
   const pedida = query.get('fonte');
-  if (pedida === 'camera' || FONTES_TELA.includes(pedida)) atenderPedido(pedida);
+  if (FONTES.includes(pedida)) atenderPedido(pedida);
 }
+
+// Mantém o vídeo como está e troca só de onde vem o som — as fontes que não
+// carregam o Discord junto são uma aba e a janela de um aplicativo.
+$('somAba').addEventListener('click', async () => {
+  if (!paineis.tela?.ativo()) return;
+  try {
+    await paineis.tela.trocarSom();
+    paineis.tela.setStatus('Som ligado, vindo da fonte escolhida.', 'ok');
+    $('somAba').textContent = 'Trocar a fonte do som';
+  } catch (err) {
+    // Cancelar a segunda janela é escolha, não falha.
+    if (err.name !== 'NotAllowedError') paineis.tela.setStatus(err.message, 'error');
+  }
+});
 
 espelharOpcoes();
 $('qualidade').addEventListener('change', (e) => mudarOpcao('bitrate', e.target.value));
 $('quadros').addEventListener('change', (e) => mudarOpcao('fps', e.target.value));
 
 window.addEventListener('beforeunload', () => {
-  for (const painel of todos()) painel.parar();
+  for (const f of FONTES) paineis[f]?.parar();
 });

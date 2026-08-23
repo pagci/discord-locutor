@@ -346,11 +346,11 @@ describe('attachBroadcaster', () => {
     expect(R.attachBroadcaster(room, socket(), pessoa('t1'))).toMatch(/já está transmitindo/);
   });
 
-  it('recusa a transmissão que passa do teto da sala', () => {
+  it('recusa a quinta transmissão simultânea', () => {
     const { room } = salaComEspectador();
-    for (let i = 0; i < 6; i++) R.attachBroadcaster(room, socket(), pessoa(`t${i}`));
+    for (let i = 0; i < 4; i++) R.attachBroadcaster(room, socket(), pessoa(`t${i}`));
 
-    expect(R.attachBroadcaster(room, socket(), pessoa('t6'))).toMatch(/Limite de 6/);
+    expect(R.attachBroadcaster(room, socket(), pessoa('t5'))).toMatch(/Limite de 4/);
   });
 
   it('reaproveita o slot de quem saiu', () => {
@@ -390,27 +390,12 @@ describe('attachBroadcaster', () => {
     );
   });
 
-  it('deixa a mesma pessoa transmitir várias telas, cada uma num slot', () => {
-    const { room, entry } = comTransmissao();
-    const tela2 = R.attachBroadcaster(room, socket(), pessoa('transmissor'), 'tela-2');
-    const tela3 = R.attachBroadcaster(room, socket(), pessoa('transmissor'), 'tela-3');
+  it('recusa a terceira transmissão da mesma pessoa', () => {
+    const { room } = comTransmissao();
+    R.attachBroadcaster(room, socket(), pessoa('transmissor'), 'camera');
 
-    expect(tela2).not.toBeTypeOf('string');
-    expect(tela3).not.toBeTypeOf('string');
-    // Slots distintos: sem isso os quadros de uma tela cairiam no decoder da outra.
-    expect(new Set([entry.slot, tela2.slot, tela3.slot]).size).toBe(3);
-    expect(R.broadcastersOf(room, 'transmissor')).toHaveLength(3);
-  });
-
-  it('só aceita telas numeradas dentro do teto', () => {
-    expect(R.fonteValida('tela')).toBe(true);
-    expect(R.fonteValida('camera')).toBe(true);
-    expect(R.fonteValida('tela-2')).toBe(true);
-    expect(R.fonteValida('tela-6')).toBe(true);
-    expect(R.fonteValida('tela-7')).toBe(false);
-    expect(R.fonteValida('tela-0')).toBe(false);
-    expect(R.fonteValida('tela-abc')).toBe(false);
-    expect(R.fonteValida('outra')).toBe(false);
+    // Fonte repetida cai na primeira recusa; o teto por pessoa é outro.
+    expect(R.broadcastersOf(room, 'transmissor')).toHaveLength(2);
   });
 });
 

@@ -373,20 +373,9 @@ video {
 /* A prévia ocupa o mesmo lugar do placeholder — um exclui o outro, e a folga
    até a ação é a mesma nos dois. Só a prévia: o vídeo do bloco no ar já tem o
    respiro das estatísticas logo abaixo. */
-.js-previa {
+#tela-previa,
+#camera-previa {
   margin-bottom: 16px;
-}
-
-/* "+ outra tela": uma faixa própria, largura cheia mesmo nas duas colunas, para
-   não disputar linha com um bloco de fonte. */
-.add-tela {
-  margin-top: 4px;
-}
-
-@media (min-width: 900px) {
-  .add-tela {
-    grid-column: 1 / -1;
-  }
 }
 
 /* Um bloco por fonte. A régua acima separa sem gastar altura, que é o que

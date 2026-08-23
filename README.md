@@ -161,18 +161,6 @@ volume, ou clica nele para silenciar.
 
 ---
 
-## Ampliar a tela
-
-Na tela em destaque, gire a **rodinha do mouse** para dar zoom e **arraste** para
-mover a parte ampliada. Os botões no alto do quadro (**−**, o nível em %, **+** e
-o de ajustar) fazem o mesmo sem a rodinha, e o de ajustar volta a caber tudo.
-
-Cada tela guarda o seu zoom: ampliar uma e voltar para outra encontra cada uma
-como você deixou. Serve para ler um texto pequeno ou olhar de perto um canto da
-tela de quem está transmitindo.
-
----
-
 ## Deu errado?
 
 **A atividade não abre, ou fica só um retângulo branco**
@@ -254,10 +242,7 @@ Para quem mexe no código:
 - **60 fps em qualquer computador.** Se o navegador não tiver codificação por
   hardware, ele não dá conta de 60 quadros em tela grande e entrega menos. A
   página de captura avisa quando isso acontece.
-- **Mais de 6 telas ao mesmo tempo** na mesma sala — somando as de todo mundo.
-  Uma pessoa sozinha pode compartilhar várias (até o teto da sala): clique em
-  **Compartilhar tela** de novo para acrescentar outra, e pare cada uma no botão
-  de parar do próprio quadro dela.
+- **Mais de 4 telas ao mesmo tempo** na mesma sala.
 
 Se você mexe em código e quer entender as decisões por trás disso,
 veja [docs/como-funciona.md](docs/como-funciona.md).
