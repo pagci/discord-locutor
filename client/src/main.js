@@ -223,9 +223,34 @@ function initials(name) {
     .toUpperCase();
 }
 
-/** Todas as transmissões de uma pessoa — hoje até duas: a tela e a câmera. */
+/** Todas as transmissões de uma pessoa: telas (uma ou várias) e a câmera. */
 const slotsOf = (userId) =>
   [...available.entries()].filter(([, a]) => a.userId === userId).map(([slot]) => slot);
+
+// Espelha o teto do servidor (rooms.js MAX_TELAS). Vive aqui porque é limite de
+// interface — o servidor recusa de qualquer jeito o que passar disso.
+const TELAS_MAX = 6;
+// A ordem em que as telas de uma pessoa são numeradas e nomeadas.
+const FONTES_TELA = ['tela', 'tela-2', 'tela-3', 'tela-4', 'tela-5', 'tela-6'];
+
+const ehCamera = (fonte) => fonte === 'camera';
+/** 1 para 'tela', N para 'tela-N'; 0 para o que não é tela. */
+const numeroDaTela = (fonte) =>
+  fonte === 'tela' ? 1 : Number(/^tela-(\d+)$/.exec(fonte ?? '')?.[1] ?? 0);
+
+/**
+ * O rótulo do canto de um tile: "Câmera", "Tela N", ou nada.
+ *
+ * A tela só ganha número quando o dono tem mais de uma — com uma só, "Tela 1"
+ * seria ruído; a câmera sempre se marca, porque divide o palco com a tela.
+ */
+function rotuloDaFonte(slot) {
+  const a = available.get(slot);
+  if (!a) return null;
+  if (ehCamera(a.fonte)) return 'Câmera';
+  const telas = slotsOf(a.userId).filter((s) => !ehCamera(available.get(s)?.fonte));
+  return telas.length > 1 ? `Tela ${numeroDaTela(a.fonte)}` : null;
+}
 
 /**
  * O que o grid desenha: uma entrada por transmissão, mais uma por pessoa que
@@ -256,6 +281,190 @@ const noDe = (s) => (s.viaRtc ? s.video : s.canvas);
 function medidaDe(s) {
   if (s.viaRtc) return { w: s.video.videoWidth, h: s.video.videoHeight };
   return { w: s.canvas.width, h: s.canvas.height };
+}
+
+// ---------------------------------------------------------------------- zoom
+
+// Não deixa ampliar além disto: passa a mostrar pixel, não detalhe — a imagem
+// já chegou rasterizada, e ampliar não inventa resolução que não veio.
+const ZOOM_MAX = 8;
+// Fora deste limiar o valor conta como "sem zoom": some o controle e o cursor
+// de arrasto, e o clique volta a alternar tela cheia.
+const ZOOM_EPS = 0.01;
+
+const zoomAtivo = (z) => z.scale > 1 + ZOOM_EPS;
+const limitar = (v, min, max) => Math.max(min, Math.min(max, v));
+const clampEscala = (k) => limitar(k, 1, ZOOM_MAX);
+
+/**
+ * Escreve o zoom no nó (canvas ou vídeo da conexão direta).
+ *
+ * `transform-origin: 0 0` para o cálculo do foco ficar linear: o ponto local
+ * (0,0) permanece no canto, e o deslocamento é sempre em coordenada de caixa.
+ * O deslocamento é preso ao intervalo que mantém a imagem cobrindo a caixa —
+ * sem isso o arrasto revelaria faixa preta em vez de mais imagem.
+ */
+function aplicarZoom(node, z) {
+  const W = node.offsetWidth;
+  const H = node.offsetHeight;
+  const ox = limitar(z.fx * W, W * (1 - z.scale), 0);
+  const oy = limitar(z.fy * H, H * (1 - z.scale), 0);
+  z.fx = W ? ox / W : 0;
+  z.fy = H ? oy / H : 0;
+  node.style.transformOrigin = '0 0';
+  node.style.transform =
+    z.scale > 1 + ZOOM_EPS ? `translate(${ox}px, ${oy}px) scale(${z.scale})` : '';
+}
+
+/** Zera qualquer zoom desenhado — usado quando o nó vira miniatura. */
+function limparZoom(node) {
+  node.style.transform = '';
+}
+
+/**
+ * Amplia mantendo fixo o ponto sob (cx, cy) em coordenadas de tela.
+ *
+ * Ancorar no cursor é o que faz a roda "chegar mais perto do que aponto" em vez
+ * de sempre do centro. A conta cai em `ox += d·(1 − k'/k)`, com `d` a distância
+ * do ponto ao canto já transformado — daí só precisar do rect atual.
+ */
+function ampliar(node, z, fator, cx, cy) {
+  const rect = node.getBoundingClientRect();
+  const k = z.scale;
+  const k2 = clampEscala(k * fator);
+  if (k2 === k) return false;
+
+  const dx = cx - rect.left;
+  const dy = cy - rect.top;
+  const W = node.offsetWidth;
+  const H = node.offsetHeight;
+  const ox = limitar(z.fx * W + dx * (1 - k2 / k), W * (1 - k2), 0);
+  const oy = limitar(z.fy * H + dy * (1 - k2 / k), H * (1 - k2), 0);
+
+  z.scale = k2;
+  z.fx = W ? ox / W : 0;
+  z.fy = H ? oy / H : 0;
+  aplicarZoom(node, z);
+  return true;
+}
+
+function resetarZoom(node, z) {
+  z.scale = 1;
+  z.fx = 0;
+  z.fy = 0;
+  aplicarZoom(node, z);
+}
+
+/**
+ * Liga roda-para-ampliar e arrastar-para-mover no palco.
+ *
+ * O arrasto só pega com zoom, para não roubar o clique que alterna tela cheia.
+ * Quando um arrasto de fato acontece, ele marca `arrastou` — e é isso que o
+ * clique consulta para não disparar a tela cheia ao fim de um empurrão.
+ */
+function ligarZoomPalco(tile, node, s, onZoom) {
+  const z = s.zoom;
+
+  const roda = (e) => {
+    e.preventDefault();
+    const fator = e.deltaY < 0 ? 1.15 : 1 / 1.15;
+    if (ampliar(node, z, fator, e.clientX, e.clientY)) onZoom();
+  };
+  tile.addEventListener('wheel', roda, { passive: false });
+
+  let arrastando = null;
+  const mover = (e) => {
+    if (!arrastando) return;
+    const W = node.offsetWidth;
+    const H = node.offsetHeight;
+    let ox = z.fx * W + (e.clientX - arrastando.x);
+    let oy = z.fy * H + (e.clientY - arrastando.y);
+    ox = limitar(ox, W * (1 - z.scale), 0);
+    oy = limitar(oy, H * (1 - z.scale), 0);
+    z.fx = W ? ox / W : 0;
+    z.fy = H ? oy / H : 0;
+    arrastando.x = e.clientX;
+    arrastando.y = e.clientY;
+    if (Math.abs(e.clientX - arrastando.ox) + Math.abs(e.clientY - arrastando.oy) > 4) {
+      tile.__arrastou = true;
+    }
+    aplicarZoom(node, z);
+  };
+  const soltar = (e) => {
+    if (!arrastando) return;
+    try {
+      tile.releasePointerCapture(e.pointerId);
+    } catch {
+      /* ponteiro já solto */
+    }
+    arrastando = null;
+    tile.classList.remove('arrastando');
+  };
+  tile.addEventListener('pointerdown', (e) => {
+    if (!zoomAtivo(z) || e.button !== 0) return;
+    arrastando = { x: e.clientX, y: e.clientY, ox: e.clientX, oy: e.clientY };
+    tile.__arrastou = false;
+    tile.classList.add('arrastando');
+    tile.setPointerCapture(e.pointerId);
+  });
+  tile.addEventListener('pointermove', mover);
+  tile.addEventListener('pointerup', soltar);
+  tile.addEventListener('pointercancel', soltar);
+}
+
+/**
+ * O controle de zoom do palco: menos, nível, mais e ajustar à tela.
+ *
+ * `stopPropagation` no clique e no pointerdown de cada botão: sem o primeiro, o
+ * clique subiria ao tile e alternaria a tela cheia; sem o segundo, apertar um
+ * botão com a imagem ampliada começaria um arrasto de pan.
+ */
+function buildZoom(tile, s, node) {
+  const wrap = document.createElement('div');
+  wrap.className = 'zoom-controls';
+
+  const mk = (glifo, aria, fn) => {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'zoom-btn';
+    b.textContent = glifo;
+    b.setAttribute('aria-label', aria);
+    b.addEventListener('pointerdown', (e) => e.stopPropagation());
+    b.addEventListener('click', (e) => {
+      e.stopPropagation();
+      fn();
+      atualizarZoom(tile, s);
+    });
+    return b;
+  };
+
+  const aoCentro = (fator) => {
+    const r = node.getBoundingClientRect();
+    ampliar(node, s.zoom, fator, r.left + r.width / 2, r.top + r.height / 2);
+  };
+
+  const menos = mk('−', 'Diminuir zoom', () => aoCentro(1 / 1.3));
+  const label = document.createElement('span');
+  label.className = 'zoom-nivel';
+  const mais = mk('+', 'Aumentar zoom', () => aoCentro(1.3));
+  const reset = mk('⤢', 'Ajustar à tela', () => resetarZoom(node, s.zoom));
+  reset.classList.add('zoom-reset');
+
+  wrap.append(menos, label, mais, reset);
+  tile.__zoomUI = { label, menos, reset };
+  atualizarZoom(tile, s);
+  return wrap;
+}
+
+/** Espelha o nível no rótulo e liga/desliga o que só faz sentido com zoom. */
+function atualizarZoom(tile, s) {
+  const ativo = zoomAtivo(s.zoom);
+  tile.classList.toggle('tem-zoom', ativo);
+  const ui = tile.__zoomUI;
+  if (!ui) return;
+  ui.label.textContent = `${Math.round(s.zoom.scale * 100)}%`;
+  ui.menos.disabled = !ativo;
+  ui.reset.disabled = !ativo;
 }
 
 function watchSlot(slot) {
@@ -563,22 +772,31 @@ function buildTile(p, { palco = false, semVideo = false, slot: slotDado = null }
   }
 
   // Sem rótulo, dois tiles da mesma pessoa lado a lado no grid não se
-  // distinguem até alguém clicar em um deles.
-  if (slot !== null && available.get(slot)?.fonte === 'camera') {
+  // distinguem até alguém clicar em um deles. Com várias telas, cada uma leva o
+  // seu número; a câmera, o nome dela.
+  const rotuloFonte = slot !== null ? rotuloDaFonte(slot) : null;
+  if (rotuloFonte) {
     const marca = document.createElement('span');
     marca.className = 'tile-fonte';
-    marca.textContent = 'Câmera';
+    marca.textContent = rotuloFonte;
     tile.append(marca);
   }
 
   const aoClicar = () => {
+    // Um arrasto de pan termina num "click"; sem esta guarda, mover a imagem
+    // ampliada alternaria a tela cheia ao soltar.
+    if (tile.__arrastou) {
+      tile.__arrastou = false;
+      return;
+    }
     if (palco) telaCheia = !telaCheia;
     else activeSlot = slot;
     renderGrid();
   };
 
   if (stream) {
-    tile.append(noDe(stream));
+    const no = noDe(stream);
+    tile.append(no);
     tile.title = palco
       ? telaCheia
         ? 'Clique para sair da tela cheia'
@@ -590,6 +808,16 @@ function buildTile(p, { palco = false, semVideo = false, slot: slotDado = null }
       e.preventDefault();
       openTileMenu(e.clientX, e.clientY, slot, p.name);
     });
+
+    // No palco a tela pode ser ampliada; na miniatura não, e o zoom que ela
+    // tivesse ganho no palco precisa sair para caber inteira ali.
+    if (palco) {
+      aplicarZoom(no, stream.zoom);
+      ligarZoomPalco(tile, no, stream, () => atualizarZoom(tile, stream));
+      tile.append(buildZoom(tile, stream, no));
+    } else {
+      limparZoom(no);
+    }
 
     // Entre pedir para assistir e o primeiro quadro chegar existe uma espera
     // real: sem este aviso ela é indistinguível de um travamento.
@@ -632,7 +860,13 @@ function buildTile(p, { palco = false, semVideo = false, slot: slotDado = null }
   if (slot !== null) footer.append(buildWatchers(slot));
   tile.append(footer);
 
-  if (isMe) {
+  // Na minha própria transmissão, o canto de cima à direita vira o botão de
+  // parar de transmitir aquela fonte — vale esteja eu assistindo a ela ou não,
+  // e é o que dá controle de cada tela sem caçar a aba de captura. Nas demais
+  // tiles minhas (só assistindo), fica o rótulo "você".
+  if (isMe && slot !== null) {
+    tile.append(buildBroadcastStop(slot, rotuloFonte));
+  } else if (isMe) {
     const you = document.createElement('span');
     you.className = 'tile-you';
     you.textContent = 'você';
@@ -640,6 +874,27 @@ function buildTile(p, { palco = false, semVideo = false, slot: slotDado = null }
   }
 
   return { el: tile, slot };
+}
+
+/** Botão de encerrar a minha própria transmissão daquela fonte. */
+function buildBroadcastStop(slot, rotulo) {
+  const fonte = available.get(slot)?.fonte ?? 'tela';
+  const nome = rotulo ?? (ehCamera(fonte) ? 'câmera' : 'tela');
+
+  const btn = document.createElement('button');
+  btn.className = 'tile-untransmit';
+  btn.dataset.tip = `Parar de transmitir ${nome}`;
+  btn.setAttribute('aria-label', `Parar de transmitir ${nome}`);
+  btn.innerHTML =
+    '<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="7" y="7" width="10" height="10" rx="1.5"/></svg>';
+  btn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    stopMyBroadcast(fonte);
+    renderBar();
+  });
+  // Não deixa um arrasto de pan (com zoom) virar clique de parar.
+  btn.addEventListener('pointerdown', (e) => e.stopPropagation());
+  return btn;
 }
 
 /** Espera pelo primeiro quadro. Sai sozinha quando o decoder desenha. */
@@ -949,14 +1204,22 @@ function renderBar() {
   const casters = participants.filter((p) => p.broadcasting);
 
   const minhas = minhasFontes();
-  const telaNoAr = minhas.has('tela') || Boolean(myBroadcast);
+  const telas = telasNoAr();
   const cameraNoAr = minhas.has('camera');
 
+  // O botão de tela agora acrescenta: a primeira, e depois cada tela extra até
+  // o teto. Parar é por tile, um controle por tela — daí ele não voltar a ser
+  // "Parar tela". Aceso enquanto houver ao menos uma no ar.
   const btn = $('share');
-  btn.classList.toggle('live', telaNoAr);
-  btn.disabled = false;
+  btn.classList.toggle('live', telas.size > 0);
+  const noLimite = telas.size >= TELAS_MAX;
+  btn.disabled = noLimite;
 
-  const rotuloShare = telaNoAr ? 'Parar tela' : 'Compartilhar tela';
+  const rotuloShare = noLimite
+    ? `Limite de ${TELAS_MAX} telas`
+    : telas.size === 0
+      ? 'Compartilhar tela'
+      : 'Compartilhar outra tela';
   btn.dataset.tip = rotuloShare;
   btn.setAttribute('aria-label', rotuloShare);
 
@@ -1011,6 +1274,11 @@ function openStream(slot, userId) {
     // Vira true no primeiro quadro desenhado. Até lá o tile mostra "Conectando…"
     // em vez de uma caixa preta que não se distingue de um travamento.
     started: false,
+    // Zoom do palco, por transmissão: quem amplia uma tela e volta para outra
+    // encontra cada uma como deixou. `scale` é o fator; `fx`/`fy` são o
+    // deslocamento em fração da caixa (independente do tamanho de exibição, para
+    // sobreviver a entrar em tela cheia ou trocar de resolução).
+    zoom: { scale: 1, fx: 0, fy: 0 },
     player: createPlayer(canvas, {
       onError: (m) => toast(m, true),
       onTamanho: () => {
@@ -2156,6 +2424,25 @@ function minhasFontes() {
 }
 
 /**
+ * As telas minhas no ar, pelo nome da fonte ('tela', 'tela-2'…).
+ *
+ * O myBroadcast entra porque a captura no iframe nasce como 'tela' antes de o
+ * `state` do servidor chegar — sem ele, o botão ofereceria a 'tela' de novo e o
+ * servidor recusaria a segunda com o mesmo nome.
+ */
+function telasNoAr() {
+  const fontes = new Set([...minhasFontes()].filter((f) => !ehCamera(f)));
+  if (myBroadcast) fontes.add('tela');
+  return fontes;
+}
+
+/** A próxima fonte de tela livre, ou null se já estou no teto. */
+function proximaFonteTela() {
+  const usadas = telasNoAr();
+  return FONTES_TELA.find((f) => !usadas.has(f)) ?? null;
+}
+
+/**
  * Existe uma aba de captura minha conectada?
  *
  * Quem responde é o servidor, pela lista `abas` do estado. Antes isto era
@@ -2379,13 +2666,12 @@ function stopMyBroadcast(fonte = null) {
 $('share').addEventListener('click', () => {
   if (!session) return;
 
-  if (minhasFontes().has('tela') || myBroadcast) {
-    stopMyBroadcast('tela');
-    renderBar();
-    return;
-  }
+  // Sempre acrescenta uma tela: a primeira ('tela'), depois 'tela-2'… até o
+  // teto. Parar cada uma é no tile dela — ver buildBroadcastStop.
+  const fonte = proximaFonteTela();
+  if (!fonte) return;
 
-  ligarFonte('tela');
+  ligarFonte(fonte);
 });
 
 $('camera').addEventListener('click', () => {

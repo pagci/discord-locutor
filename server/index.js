@@ -1263,7 +1263,7 @@ server.on('upgrade', (req, socket, head) => {
   // rotula o stream e escolhe qual das duas vagas da pessoa é ocupada, e o teto
   // por pessoa é imposto no registro, não aqui.
   const pedida = url.searchParams.get('fonte');
-  const fonte = R.FONTES.has(pedida) ? pedida : 'tela';
+  const fonte = R.fonteValida(pedida) ? pedida : 'tela';
   // A aba de captura abre esta conexão ao carregar, antes de qualquer captura.
   const controle = url.searchParams.get('modo') === 'controle';
 
@@ -1414,7 +1414,7 @@ function handleViewer(ws, room, auth) {
     // Ligar a outra fonte sem abrir uma segunda aba: quem já está transmitindo
     // tem uma aba conectada, e é ela que consegue capturar. A atividade só
     // pede; a aba decide o que dá para fazer sem gesto (câmera dá, tela não).
-    if (msg.type === 'start-broadcast' && R.FONTES.has(msg.fonte)) {
+    if (msg.type === 'start-broadcast' && R.fonteValida(msg.fonte)) {
       // Vai para a aba, e não para as conexões de transmissão: é ela quem tem o
       // gesto do usuário e a permissão, e ela existe mesmo com nada no ar.
       const n = R.toControls(room, auth.uid, {
@@ -1436,7 +1436,7 @@ function handleViewer(ws, room, auth) {
     if (msg.type === 'stop-broadcast') {
       // Sem fonte, para tudo o que a pessoa estiver transmitindo. É o que o
       // botão da barra sempre fez, e continua valendo para quem só tem uma.
-      const fonte = R.FONTES.has(msg.fonte) ? msg.fonte : null;
+      const fonte = R.fonteValida(msg.fonte) ? msg.fonte : null;
       const alvos = R.broadcastersOf(room, auth.uid, fonte);
 
       for (const entry of alvos) R.sendJson(entry.ws, { type: 'stop-request' });

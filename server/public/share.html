@@ -8,7 +8,7 @@
          dos cabeçalhos no-store guardou a versão antiga por heurística do
          navegador, e continuaria usando ela para sempre. Trocar a query força
          uma URL nova. Incremente ao publicar mudanças nesses arquivos. -->
-    <link rel="stylesheet" href="/share.css?v=25" />
+    <link rel="stylesheet" href="/share.css?v=26" />
   </head>
   <body>
     <main class="card">
@@ -20,87 +20,44 @@
            suporte. Os erros de cada fonte ficam no bloco dela. -->
       <p id="pageStatus" class="status" role="status"></p>
 
-      <div class="fontes">
-        <section class="bloco" id="bloco-tela">
-          <h2>Tela</h2>
+      <!-- Ajustes globais: valem para toda tela e para a câmera. Fora dos blocos
+           de propósito — dá para escolher antes de começar e para corrigir com
+           algo já no ar, que é quando o problema costuma aparecer. -->
+      <div class="ajustes">
+        <label>
+          Qualidade
+          <select id="qualidade">
+            <option value="800000">Leve — 0,8 Mbps</option>
+            <option value="1500000">Média — 1,5 Mbps</option>
+            <option value="2500000">Boa — 2,5 Mbps</option>
+            <option value="5000000">Alta — 5 Mbps</option>
+            <option value="8000000">Máxima — 8 Mbps</option>
+          </select>
+        </label>
+        <label>
+          Quadros
+          <select id="quadros">
+            <option value="15">15 fps</option>
+            <option value="30">30 fps</option>
+            <option value="60">60 fps</option>
+          </select>
+        </label>
+      </div>
 
-          <!-- Fora do setup e do live de propósito: dá para escolher antes de
-               começar e para corrigir com a transmissão no ar, que é quando o
-               problema costuma aparecer. Vale para a câmera também. -->
-          <div class="ajustes">
-            <label>
-              Qualidade
-              <select id="qualidade">
-                <option value="800000">Leve — 0,8 Mbps</option>
-                <option value="1500000">Média — 1,5 Mbps</option>
-                <option value="2500000">Boa — 2,5 Mbps</option>
-                <option value="5000000">Alta — 5 Mbps</option>
-                <option value="8000000">Máxima — 8 Mbps</option>
-              </select>
-            </label>
-            <label>
-              Quadros
-              <select id="quadros">
-                <option value="15">15 fps</option>
-                <option value="30">30 fps</option>
-                <option value="60">60 fps</option>
-              </select>
-            </label>
-          </div>
-
-          <div id="tela-setup">
-            <div class="sem-preview" id="tela-vazio">Sem preview</div>
-            <video id="tela-previa" muted playsinline hidden></video>
-
-            <p class="note" id="tela-nota">
-              Marque "Compartilhar o áudio" na janela do navegador para levar o som.
-            </p>
-
-            <!-- A seta escolhe sem transmitir; o botão transmite o que estiver
-                 escolhido. Separados porque conferir o enquadramento e ir ao
-                 ar são decisões diferentes, e juntas não dá para voltar atrás
-                 diante de quem já está assistindo. -->
-            <div class="acao">
-              <button id="tela-start" class="primary">Escolher tela e transmitir</button>
-              <button
-                id="tela-escolher"
-                class="primary seta"
-                title="Ver outra tela antes de transmitir"
-                aria-label="Ver outra tela antes de transmitir"
-              >
-                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 15l6-6 6 6" /></svg>
-              </button>
-            </div>
-          </div>
-
-          <div id="tela-live" hidden>
-            <div class="live-badge"><span class="dot"></span> No ar</div>
-            <video id="tela-preview" muted playsinline></video>
-            <div class="stats">
-              <div><strong id="tela-viewers">0</strong><span>assistindo</span></div>
-              <div><strong id="tela-fps">—</strong><span>quadros</span></div>
-              <div><strong id="tela-bitrate">—</strong><span>enviando</span></div>
-              <div><strong id="tela-elapsed">00:00</strong><span>no ar</span></div>
-            </div>
-            <button id="somAba" class="secondary" hidden>Som de uma aba ou janela</button>
-            <button id="tela-stop" class="danger">Parar de transmitir a tela</button>
-          </div>
-
-          <p id="tela-status" class="status" role="status"></p>
-        </section>
+      <div id="fontes" class="fontes">
+        <!-- Os blocos de tela entram aqui, antes da câmera. -->
 
         <section class="bloco" id="bloco-camera">
           <h2>Câmera</h2>
 
-          <div id="camera-setup">
-            <div class="sem-preview" id="camera-vazio">Sem preview</div>
-            <video id="camera-previa" muted playsinline hidden></video>
+          <div class="js-setup">
+            <div class="sem-preview js-vazio">Sem preview</div>
+            <video class="js-previa" muted playsinline hidden></video>
 
             <div class="acao">
-              <button id="camera-start" class="primary">Ligar a câmera</button>
+              <button class="primary js-start">Ligar a câmera</button>
               <button
-                id="camera-escolher"
-                class="primary seta"
+                class="primary seta js-escolher"
                 title="Escolher a câmera"
                 aria-label="Escolher a câmera"
                 aria-haspopup="menu"
@@ -112,24 +69,27 @@
               <!-- Preenchido depois da permissão: antes dela o navegador entrega
                    os dispositivos sem nome, e uma lista de itens em branco não
                    ajuda ninguém a escolher. -->
-              <ul id="camera-menu" class="menu" role="menu" hidden></ul>
+              <ul class="menu js-menu" role="menu" hidden></ul>
             </div>
           </div>
 
-          <div id="camera-live" hidden>
+          <div class="js-live" hidden>
             <div class="live-badge"><span class="dot"></span> No ar</div>
-            <video id="camera-preview" muted playsinline></video>
+            <video class="js-preview" muted playsinline></video>
             <div class="stats">
-              <div><strong id="camera-viewers">0</strong><span>assistindo</span></div>
-              <div><strong id="camera-fps">—</strong><span>quadros</span></div>
-              <div><strong id="camera-bitrate">—</strong><span>enviando</span></div>
-              <div><strong id="camera-elapsed">00:00</strong><span>no ar</span></div>
+              <div><strong class="js-viewers">0</strong><span>assistindo</span></div>
+              <div><strong class="js-fps">—</strong><span>quadros</span></div>
+              <div><strong class="js-bitrate">—</strong><span>enviando</span></div>
+              <div><strong class="js-elapsed">00:00</strong><span>no ar</span></div>
             </div>
-            <button id="camera-stop" class="danger">Desligar a câmera</button>
+            <button class="danger js-stop">Desligar a câmera</button>
           </div>
 
-          <p id="camera-status" class="status" role="status"></p>
+          <p class="status js-status" role="status"></p>
         </section>
+
+        <!-- Uma tela a mais, sem voltar à atividade. Escondido no teto. -->
+        <button id="addTela" class="secondary add-tela" hidden>+ Compartilhar outra tela</button>
       </div>
 
       <footer>
@@ -137,6 +97,54 @@
       </footer>
     </main>
 
-    <script type="module" src="/share.js?v=25"></script>
+    <!-- Molde de um bloco de tela. Clonado uma vez por tela compartilhada; os
+         seletores internos são por classe (.js-*) para as cópias não colidirem
+         em id, como colidiriam com os ids fixos de antes. -->
+    <template id="tpl-tela">
+      <section class="bloco bloco-tela">
+        <h2 class="js-titulo">Tela</h2>
+
+        <div class="js-setup">
+          <div class="sem-preview js-vazio">Sem preview</div>
+          <video class="js-previa" muted playsinline hidden></video>
+
+          <p class="note js-nota">
+            Marque "Compartilhar o áudio" na janela do navegador para levar o som.
+          </p>
+
+          <!-- A seta escolhe sem transmitir; o botão transmite o que estiver
+               escolhido. Separados porque conferir o enquadramento e ir ao ar
+               são decisões diferentes, e juntas não dá para voltar atrás diante
+               de quem já está assistindo. -->
+          <div class="acao">
+            <button class="primary js-start">Escolher tela e transmitir</button>
+            <button
+              class="primary seta js-escolher"
+              title="Ver outra tela antes de transmitir"
+              aria-label="Ver outra tela antes de transmitir"
+            >
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 15l6-6 6 6" /></svg>
+            </button>
+          </div>
+        </div>
+
+        <div class="js-live" hidden>
+          <div class="live-badge"><span class="dot"></span> No ar</div>
+          <video class="js-preview" muted playsinline></video>
+          <div class="stats">
+            <div><strong class="js-viewers">0</strong><span>assistindo</span></div>
+            <div><strong class="js-fps">—</strong><span>quadros</span></div>
+            <div><strong class="js-bitrate">—</strong><span>enviando</span></div>
+            <div><strong class="js-elapsed">00:00</strong><span>no ar</span></div>
+          </div>
+          <button class="secondary js-somAba" hidden>Som de uma aba ou janela</button>
+          <button class="danger js-stop">Parar de transmitir a tela</button>
+        </div>
+
+        <p class="status js-status" role="status"></p>
+      </section>
+    </template>
+
+    <script type="module" src="/share.js?v=26"></script>
   </body>
 </html>
