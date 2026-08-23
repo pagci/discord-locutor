@@ -187,14 +187,15 @@ mesmo segredo.
 - Um `S` (base do shard) ao lado do `P` que já existe para o `/.proxy`. Dentro do
   Discord vale `${P}/n<i>`; fora, a origem absoluta. Sem sharding fica igual ao
   `P`, e nenhuma URL muda de forma.
-- `S` é fixado em `authDiscord`, depois da troca do code e antes do
-  `/api/session` — com a config **se ela já tiver chegado, e nunca esperando por
-  ela**. Ela é disparada no arranque em paralelo e quase sempre chega antes, mas
-  "quase sempre" não basta num arranque que já ficou preso em "Está demorando…"
-  uma vez. Chegar atrasada custa um `409` e uma repetição; esperar por ela
-  custaria a atividade parada. Numa máquina só não custa nem isso, porque não há
-  nada para decidir — e é por isso que ligar este código sem as variáveis não
-  muda nem o tempo de arranque.
+- `S` é fixado **pela resposta do servidor**, não por cálculo do cliente. Toda
+  resposta que entrega tokens de sala traz também `node`, dizendo de quem é a
+  sala, e o `openRoom` fixa a base a partir dele antes de qualquer conexão.
+- O cálculo local continua existindo como palpite inicial, mas ele não é mais o
+  que decide. Ele depende da config ter chegado, e quando ela atrasa a base fica
+  no ponto de entrada, que reveza. Para o HTTP isso se conserta sozinho (`409` e
+  repete); **para o WebSocket não existe essa saída** — ele só fecha, e o
+  navegador nem expõe o motivo. Foi exatamente esse buraco que derrubou a
+  produção; ver a seção de cicatrizes no fim.
 - As chamadas de sala passam de `${P}` para `${S}`. `/api/config`, `/api/token` e
   `/api/ice` ficam no `${P}`: não têm estado, qualquer máquina responde.
 - O `connect()` e o `wsUrl` do broadcaster montam o endereço com `wsBase()`, que
@@ -287,10 +288,51 @@ Vale ser explícito, porque é fácil esperar demais de sharding:
    - bater com prefixo de outra máquina tem de dar `421`;
    - duas abas na mesma sala, pelo `share.html`, têm de ver o vídeo passar — o
      que só acontece se as duas caíram na mesma máquina.
-4. **Em produção**, com uma call real: abrir o `/admin` de cada máquina e
-   confirmar que as calls estão divididas e que a banda do relay caiu por
-   máquina. O painel é por máquina — ele não agrega, e nenhuma tela mostra as
-   duas somadas.
+4. **Em produção**, com uma call real: abrir o `/admin` e olhar a tabela
+   **Máquinas**. Ela mostra o total no topo e a quebra por máquina embaixo — se
+   as linhas tiverem números parecidos, dividiu.
+
+   Não tente abrir o painel no subdomínio de cada máquina: o cookie do painel é
+   gravado no domínio de entrada e não é enviado para os subdomínios, então lá
+   você só encontra a tela de login de novo. É por isso que quem junta é o
+   servidor, e não o navegador.
+
+## Cicatrizes
+
+O que quebrou de verdade quando isto foi ligado em produção, para ninguém
+reaprender do jeito caro.
+
+**Um laço de reconexão sem freio derrubou a atividade inteira.** Quando o aperto
+de mão do WebSocket é recusado, o cliente descartava o token e refazia o fluxo
+todo *na hora*, sem espera. Esse código foi escrito para uma causa só — token
+vencido —, onde falhar duas vezes seguidas era improvável. O sharding criou uma
+recusa que **se repete** (a máquina errada responde `409`), e o mesmo código
+virou laço apertado.
+
+O que transformou isso em incêndio: **todo o tráfego da Activity sai pelos poucos
+IPs do proxy do Discord**. Não são milhares de usuários com endereços diferentes
+— para a borda, é um punhado de IPs. Alguns clientes em laço já parecem um
+ataque, e a resposta foi `429` para todo mundo, inclusive para quem não estava em
+laço. E o `429` realimenta: com a borda barrando, a `/api/config` passa a falhar,
+mais clientes ficam sem saber a máquina, mais entram no laço.
+
+Três lições que valem além deste projeto:
+
+- **Todo caminho de recuperação automática precisa de freio**, mesmo o que "só
+  dispara em caso raro". O que torna raro é a causa, e causas novas aparecem.
+- **O navegador não expõe o status de um aperto de mão de WebSocket que falhou.**
+  `401` e `409` chegam iguais. Por isso o freio é por tempo e tentativa, nunca
+  por causa.
+- **Deploy não alcança quem já está com a atividade aberta.** O JavaScript velho
+  segue rodando na memória até a pessoa fechar e abrir. Quando o conserto é no
+  cliente, a única alavanca imediata é **tirar o gatilho do lado do servidor** —
+  no caso, desligar o `SHARD_NODES`, que faz o `409` deixar de existir e os
+  clientes velhos pararem sozinhos.
+
+**O que ajudou a achar:** o site fora do Discord continuou funcionando o tempo
+todo. A única diferença entre os dois caminhos era que o do site espera a config
+antes de agir, e o do Discord não — o que apontou direto para a base indefinida.
+Quando um caminho quebra e o outro não, a diferença entre eles é o bug.
 
 ## Fontes
 
