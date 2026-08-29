@@ -3,6 +3,7 @@ node_modules/
 .cache/
 site/
 coverage/
+vendor/
 package-lock.json
 
 # Worktrees do Claude Code: copia do repositorio, revisada no lugar de origem.

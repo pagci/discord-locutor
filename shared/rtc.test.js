@@ -15,9 +15,24 @@
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { ajustarEnvio, criarPeer, MORTO, PRAZO_CONEXAO_MS, resumoPeer } from './rtc.js';
+import {
+  ajustarEnvio,
+  criarPeer,
+  MORTO,
+  politicaIceDaUrl,
+  PRAZO_CONEXAO_MS,
+  resumoPeer,
+} from './rtc.js';
 
 const STUN = 'stun:stun.l.google.com:19302';
+
+describe('política ICE controlada pelo ensaio', () => {
+  it('mantém todos os candidatos por padrão e força TURN apenas por parâmetro explícito', () => {
+    expect(politicaIceDaUrl('')).toBe('all');
+    expect(politicaIceDaUrl('?rtcPolicy=relay')).toBe('relay');
+    expect(politicaIceDaUrl('?rtcPolicy=qualquer-outra-coisa')).toBe('all');
+  });
+});
 
 /** Um RTCPeerConnection de mentira: guarda os ouvintes para o teste disparar. */
 class PeerFalso {
@@ -326,7 +341,13 @@ describe('resumoPeer', () => {
   it('ignora o par que não foi escolhido', async () => {
     const pc = comEstatisticas([par({ id: 'a', state: 'failed' })]);
 
-    expect(await resumoPeer(pc)).toMatchObject({ rtt: null, relay: false });
+    expect(await resumoPeer(pc)).toMatchObject({ rtt: null, relay: null });
+  });
+
+  it('não chama stats parcial de P2P quando o candidato local ainda não apareceu', async () => {
+    const pc = comEstatisticas([par()]);
+
+    expect(await resumoPeer(pc)).toMatchObject({ rtt: 42, relay: null });
   });
 
   it('devolve só o que dá para agir: ida-e-volta e se passa por TURN', async () => {
@@ -349,6 +370,6 @@ describe('resumoPeer', () => {
       throw new Error('sem suporte');
     };
 
-    expect(await resumoPeer(pc)).toEqual({ rtt: null, relay: false });
+    expect(await resumoPeer(pc)).toEqual({ rtt: null, relay: null });
   });
 });

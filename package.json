@@ -20,10 +20,13 @@
     "smoke": "node scripts/smoke.mjs",
     "smoke:controle": "node scripts/smoke-controle.mjs",
     "smoke:admin": "node scripts/admin-smoke.mjs",
+    "ensaio:rede": "node scripts/ensaio-delay-rede.mjs",
     "test": "vitest run",
+    "test:webtransport": "node scripts/test-webtransport.mjs",
+    "verify:ws-only": "node scripts/verify-ws-only-independent.mjs",
     "test:watch": "vitest",
-    "coverage": "vitest run --coverage",
-    "lint": "eslint .",
+    "coverage": "node scripts/coverage.mjs",
+    "lint": "eslint . && eslint --no-ignore vendor/fails-components-webtransport/lib/session.js vendor/fails-components-webtransport/lib/index.node.js",
     "lint:fix": "eslint . --fix",
     "format": "prettier --write \"**/*.{js,mjs,json,yml,yaml}\"",
     "format:check": "prettier --check \"**/*.{js,mjs,json,yml,yaml}\""
@@ -35,8 +38,13 @@
     "eslint": "^10.8.1",
     "eslint-config-prettier": "^10.1.8",
     "globals": "^17.11.0",
+    "istanbul-lib-coverage": "^3.2.2",
+    "istanbul-lib-report": "^3.0.1",
+    "istanbul-reports": "^3.2.0",
     "jsdom": "^30.0.1",
+    "playwright-core": "^1.62.1",
     "prettier": "^3.9.6",
+    "selfsigned": "^5.5.0",
     "vitest": "^4.1.11"
   }
 }

@@ -31,10 +31,71 @@ export const FONTES = new Set(['tela', 'camera']);
 // Sala é objeto em memória criado por qualquer pessoa autenticada: sem teto,
 // um laço de "criar sala" consome a RAM do processo.
 const MAX_ROOMS_PER_INSTANCE = 20;
-const MAX_BUFFERED_BYTES = 2 * 1024 * 1024;
+
+// A fila de um espectador é medida em TEMPO de mídia, não em bytes: 2 MB fixos
+// eram ~6 segundos de atraso acumulado a 2,5 Mb/s antes de qualquer descarte —
+// e delay acumulativo é exatamente isso. Tela ao vivo não pode acumular
+// segundos de buffer, então o orçamento é uma fração de segundo da taxa da
+// stream.
+const MAX_FILA_SEGUNDOS = 0.3;
+
+// O bootstrap NÃO é um piso permanente: a 100 kbps, 96 KB seriam ~7,9 s de
+// mídia, que é justamente o atraso que este módulo existe para não ter. Ele
+// vale só enquanto a medida não presta — ver AQUECIMENTO_MS — e some assim que
+// existe taxa confiável, medida ou reportada.
+const BOOTSTRAP_BYTES = 96 * 1024;
+
+// Quanto tempo a medida leva para valer. Não é número escolhido a dedo: o
+// estimador divide pelo tempo de vida da transmissão, então antes de 1 s o
+// denominador é curto demais para uma amostra representativa e a taxa sai
+// enviesada para baixo. Fora dessa janela o estimador é confiável.
+const AQUECIMENTO_MS = 1000;
+
+// Um keyframe é, por natureza, maior que a média da stream. Julgá-lo pela fila
+// comum impediria a recuperação em bitrate baixo — sem keyframe o espectador
+// não tem imagem nenhuma. A exceção é atômica (só com socket drenado) e tem
+// teto próprio, em TEMPO como todo o resto: nunca `maxPayload`, que a 100 kbps
+// seriam centenas de segundos de mídia numa fila só.
+const TETO_KEYFRAME_SEGUNDOS = 2.0;
+
+// Janela do estimador de taxa da transmissão.
+const JANELA_TAXA_S = 5;
+
+// Quantos descartes de admissão na janela marcam um espectador como degradando.
+// Dois picos aparecem em rede limpa quando quadros encostam juntos no orçamento;
+// três já formam uma rajada que justifica reduzir a origem.
+const DESCARTES_PARA_DEGRADAR = 3;
+// Em QUIC, uma rajada deste tamanho já prova que o orçamento físico foi
+// ultrapassado. Esperar vários degraus intermediários cria backlog antes de o
+// sinal nativo aparecer; o perfil de sobrevivência precisa valer nesta janela.
+const DESCARTES_WEBTRANSPORT_EMERGENCIA = 8;
+// O wire já comprovou um buraco de sequência, portanto reage antes da fila.
+const PERDAS_WIRE_PARA_DEGRADAR = 2;
+// Expiração nativa significa que um datagrama já envelheceu 250 ms dentro do
+// QUIC: é evidência direta de que a oferta não cabe no enlace, não apenas um
+// pico da fila JS. O proxy de ensaio cruza o enlace limitado na ida e na volta;
+// portanto ~445 kb/s de vídeo (seis degraus), somados a áudio e FEC, ainda
+// excedem 600 kb/s. Treze degraus levam imediatamente o vídeo ao piso de
+// 60 kb/s; junto do áudio emergencial a 32 kb/s, o pior caso com FEC atravessa
+// as duas pernas do relay sem transformar congestionamento em fila visual.
+const PASSOS_PRESSAO_NATIVA = 13;
+// Um contador nativo isolado também aparece ao abrir/fechar o gate de saúde e
+// não prova congestionamento persistente. Três sinais em dois segundos ainda
+// reagem em menos de uma janela sob 5% de perda, sem jogar uma sessão limpa no
+// piso físico por uma única amostra espúria.
+const PRESSAO_TRANSPORTE_PARA_EMERGENCIA = 3;
+const JANELA_PRESSAO_TRANSPORTE_MS = 2000;
+
+// Assimetria deliberada: descer é rápido e barato, subir é devagar e exige
+// prova repetida de saúde. É a histerese que impede o laço de oscilar.
+const DOWN_COOLDOWN_MS = 2000;
+const UP_COOLDOWN_MS = 10 * 1000;
+const JANELAS_LIMPAS_PARA_SUBIR = 2;
 
 // Intervalo mínimo entre dois pedidos de keyframe para a mesma transmissão.
 const KEYFRAME_ASK_EVERY_MS = 1000;
+const KEYFRAME_RECOVERY_ASK_EVERY_MS = 350;
+const CHUNKS_DEBOUNCE_MS = 100;
 const MAX_NAME = 32;
 const MAX_ROOM_NAME = 40;
 
@@ -43,12 +104,16 @@ const MAX_ROOM_NAME = 40;
 // 12s cobre um reload com folga e some rápido o bastante para não deixar sala
 // fantasma na lista.
 const EMPTY_GRACE_MS = 12 * 1000;
+// QUIC pode fechar uma sessão sob congestionamento sem a pessoa ter parado a
+// captura. Slot, viewers e configs sobrevivem nesta janela para a nova sessão.
+const BROADCASTER_RECONNECT_GRACE_MS = 8 * 1000;
 // Quanto tempo a transmissão de alguém sobrevive à saída dessa pessoa da sala.
 // Existe pelo mesmo motivo da carência acima: recarregar a atividade desconecta
 // e reconecta, e sem ela um F5 derrubaria a transmissão de quem não saiu de
 // lugar nenhum.
 const SEM_PRESENCA_MS = 15 * 1000;
 const SWEEP_EVERY_MS = 4 * 1000;
+const QUALITY_DEBUG = process.env.WT_WIRE_DEBUG === '1';
 
 // Freio de força bruta: sem isso uma senha curta cai em segundos, porque o
 // endpoint responde tão rápido quanto a rede permite.
@@ -135,6 +200,105 @@ function trafficSnapshot(counter, windowSeconds = 5) {
     transmittedBytesPerSecond: transmittedBytes / actualWindow,
     droppedBytesPerSecond: droppedBytes / actualWindow,
   };
+}
+
+// ---------------------------------------------------- taxa da transmissão
+
+/**
+ * Estimador de taxa PRÓPRIO de cada transmissão, e não do socket.
+ *
+ * `entry.traffic` não serve para governar orçamento: ele nasce em
+ * `attachBroadcaster`, e a aba de captura fica aberta muito antes de alguém
+ * clicar em transmitir. Uma aba aberta há um minuto que começa a transmitir
+ * agora dividiria meio segundo de mídia por cinco segundos de janela — taxa até
+ * dez vezes menor que a real, orçamento dez vezes menor que o devido, e
+ * descarte em massa no primeiro segundo de TODA transmissão.
+ *
+ * Zerar aqui, em cada `startStream`, elimina por construção quatro
+ * contaminações: a transmissão anterior no mesmo segundo, o tráfego anterior ao
+ * `start`, o posterior ao `stop` e a vida da conexão antes do stream.
+ */
+function estimadorTaxa(agora = Date.now()) {
+  return { desde: agora, baldes: new Map() };
+}
+
+function registrarTaxa(estimador, bytes, agora = Date.now()) {
+  if (!estimador || !Number.isFinite(bytes) || bytes <= 0) return;
+  const segundo = Math.floor(agora / 1000);
+  estimador.baldes.set(segundo, (estimador.baldes.get(segundo) ?? 0) + bytes);
+  for (const chave of estimador.baldes.keys()) {
+    if (chave < segundo - JANELA_TAXA_S) estimador.baldes.delete(chave);
+  }
+}
+
+/**
+ * Bytes por segundo desta transmissão, medidos desde que ela começou.
+ *
+ * O balde é de 1 segundo, então a fase do relógio dentro do segundo introduz
+ * erro — declarado e limitado, não escondido: com a janela ancorada no início
+ * do stream ele fica bem abaixo dos 20% que o contrato tolera, porque
+ * numerador e denominador crescem juntos.
+ */
+function taxaMedida(estimador, agora) {
+  if (!estimador) return 0;
+  const segundo = Math.floor(agora / 1000);
+  const primeiro = segundo - JANELA_TAXA_S + 1;
+  let bytes = 0;
+  for (const [chave, valor] of estimador.baldes) {
+    if (chave >= primeiro) bytes += valor;
+  }
+  const janela = Math.min(JANELA_TAXA_S, Math.max(0, agora - estimador.desde) / 1000);
+  return janela > 0 ? bytes / janela : 0;
+}
+
+/**
+ * A taxa que governa o orçamento, em bytes por segundo — ou `null` quando não
+ * há informação confiável nenhuma.
+ *
+ * Fria, a medida é enviesada para baixo por construção, então um `min` com ela
+ * puxaria o orçamento junto e o snapshot do transmissor não serviria para nada
+ * justamente quando é a única informação boa. Fria, portanto, o teto reportado
+ * SUBSTITUI a medida; aquecida, ele apenas a limita — e é isso que faz uma
+ * queda de qualidade valer no mesmo instante em que o transmissor a aplica, sem
+ * esperar cinco segundos de média convergirem.
+ */
+function taxaDoOrcamento(entry, agora) {
+  const teto = entry.qualidade ? entry.qualidade.bitrate / 8 : null;
+  const aquecida = entry.startedAt !== null && agora - entry.startedAt >= AQUECIMENTO_MS;
+  if (!aquecida) return teto;
+
+  const medida = taxaMedida(entry.taxa, agora);
+  return teto === null ? medida : Math.min(medida, teto);
+}
+
+/**
+ * Estado de qualidade reportado pelo transmissor.
+ *
+ * O servidor ESPELHA em vez de contar. Um contador próprio aqui seria a escada
+ * do cliente escrita duas vezes, livre para divergir dela — e a divergência
+ * apareceria como dívida de `quality-up` que nunca fecha. `degraus` vem da
+ * escada que o executa, então a recuperação é finita por construção.
+ *
+ * É entrada externa: validada na fronteira, uma vez, antes de virar estado de
+ * domínio. Mensagem malformada é ignorada e o estado anterior permanece — um
+ * transmissor adulterado não escreve no laço que governa a sala.
+ */
+export function setQuality(room, entry, snapshot) {
+  if (!entry || !snapshot || typeof snapshot !== 'object') return false;
+  const { degraus, bitrate, fps, piso } = snapshot;
+  if (!Number.isInteger(degraus) || degraus < 0) return false;
+  if (!Number.isFinite(bitrate) || bitrate <= 0) return false;
+  if (!Number.isFinite(fps) || fps <= 0) return false;
+  if (typeof piso !== 'boolean') return false;
+
+  entry.degraus = degraus;
+  entry.noPiso = piso;
+  entry.qualidade = { bitrate, fps };
+  const state = { type: 'quality-state', slot: entry.slot, degraus, bitrate, fps, piso };
+  for (const viewer of room?.viewers ?? []) {
+    if (viewer.__watching?.has(entry.slot)) sendJson(viewer, state);
+  }
+  return true;
 }
 
 // Uma pessoa pode ter duas transmissões ao mesmo tempo, então o uid sozinho não
@@ -422,10 +586,114 @@ function derrubarAbandonadas(room, now) {
   }
 }
 
+/**
+ * Qualidade adaptativa: o feedback do relay para quem transmite.
+ *
+ * O servidor é o único lado que enxerga todos os espectadores ao mesmo tempo,
+ * então é ele quem percebe que a sala está sofrendo. Ele decide QUANDO; o
+ * transmissor, dono da escada, decide QUANTO e reporta de volta.
+ *
+ * Três estados de janela, e a diferença entre os dois últimos é o que impede a
+ * recuperação de ser otimista demais:
+ *
+ * - suja: alguém pelo relay derrubou quadro demais — reduzir;
+ * - limpa: há espectador pelo relay e nenhum sofrendo — prova de saúde;
+ * - sem evidência: não há espectador pelo relay nenhum. Isso NÃO é prova de
+ *   saúde, é ausência de prova, e por isso quebra a sequência de janelas
+ *   limpas em vez de contar como uma delas.
+ *
+ * Com todo mundo em WebRTC o laço se suspende sozinho por essa definição, sem
+ * caso especial: não há quem degrade nem prova de que está tudo bem.
+ */
+function avaliarQualidade(room, now) {
+  for (const entry of room.broadcasters.values()) {
+    if (!entry.streaming) continue;
+
+    let relayOnly = 0;
+    let degradando = false;
+    let webTransportEmApuros = false;
+    let maiorNumeroDeDescartes = 0;
+    for (const v of room.viewers) {
+      if (v.readyState !== v.OPEN) continue;
+      if (!v.__watching?.has(entry.slot)) continue;
+      // Quem recebe pela conexão direta não consome o relay: o que ele sofre
+      // não é problema desta sala, e o que ficou na fila dele não conta.
+      if (v.__rtc?.has(entry.slot)) continue;
+      relayOnly++;
+      const descartes = v.__descartes?.get(entry.slot) ?? 0;
+      maiorNumeroDeDescartes = Math.max(maiorNumeroDeDescartes, descartes);
+      if (descartes >= DESCARTES_PARA_DEGRADAR) degradando = true;
+      if (v.transport === 'webtransport' && descartes >= DESCARTES_WEBTRANSPORT_EMERGENCIA) {
+        webTransportEmApuros = true;
+      }
+    }
+
+    if (QUALITY_DEBUG && relayOnly > 0 && (maiorNumeroDeDescartes > 0 || entry.degraus > 0)) {
+      console.log(
+        `[quality] room=${room.id} slot=${entry.slot} relay=${relayOnly} drops=${maiorNumeroDeDescartes} steps=${entry.degraus} action=${degradando ? 'down' : 'clean'}`,
+      );
+    }
+
+    for (const v of room.viewers) v.__descartes?.delete(entry.slot);
+
+    if (relayOnly === 0) {
+      entry.janelasLimpas = 0;
+      continue;
+    }
+
+    if (degradando) {
+      reduzirQualidade(
+        entry,
+        now,
+        webTransportEmApuros
+          ? PASSOS_PRESSAO_NATIVA
+          : passosPorSeveridade(maiorNumeroDeDescartes, DESCARTES_PARA_DEGRADAR),
+        { urgente: webTransportEmApuros },
+      );
+      continue;
+    }
+
+    entry.janelasLimpas++;
+    if (
+      entry.degraus > 0 &&
+      entry.janelasLimpas >= JANELAS_LIMPAS_PARA_SUBIR &&
+      now - entry.ultimoAjuste >= UP_COOLDOWN_MS
+    ) {
+      sendJson(entry.ws, { type: 'quality-up' });
+      entry.ultimoAjuste = now;
+      entry.janelasLimpas = 0;
+    }
+  }
+}
+
+/**
+ * Uma rajada grande não é quatro incidentes independentes: é uma prova mais
+ * forte de que o teto atual não cabe. Traduzir a razão perda/limiar em poucos
+ * degraus deixa o encoder chegar ao enlace em uma janela, sem remover o
+ * cooldown que impede oscilação. O teto de quatro mantém a queda gradual e
+ * limita qualquer sinal remoto isolado.
+ */
+function passosPorSeveridade(total, limiar) {
+  if (!Number.isFinite(total) || !Number.isFinite(limiar) || limiar <= 0) return 1;
+  return Math.max(1, Math.min(4, Math.ceil(total / limiar)));
+}
+
+function reduzirQualidade(entry, now = Date.now(), passos = 1, { urgente = false } = {}) {
+  entry.janelasLimpas = 0;
+  // No piso da escada o transmissor já não tem o que ceder: insistir só
+  // geraria dívida de `quality-up` que a recuperação teria de pagar depois.
+  if (entry.noPiso || (!urgente && now - entry.ultimoAjuste < DOWN_COOLDOWN_MS)) return false;
+  const steps = Math.max(1, Math.min(PASSOS_PRESSAO_NATIVA, Math.ceil(Number(passos) || 1)));
+  sendJson(entry.ws, { type: 'quality-down', steps });
+  entry.ultimoAjuste = now;
+  return true;
+}
+
 const sweeper = setInterval(() => {
   const now = Date.now();
   for (const room of rooms.values()) {
     derrubarAbandonadas(room, now);
+    avaliarQualidade(room, now);
 
     const empty = room.viewers.size === 0 && room.broadcasters.size === 0;
 
@@ -557,18 +825,36 @@ export function broadcastState(room) {
  * pede é justamente quem já está com a conexão apertada. Sem o intervalo, dez
  * espectadores em apuros virariam dez keyframes seguidos — o remédio entupindo
  * o cano que ele deveria desentupir. Um serve todos, porque o transmissor manda
- * para a sala inteira.
+ * para a sala inteira. A única exceção é um gap já comprovado no viewer: ele
+ * pode ultrapassar um pedido normal recente, mas continua coalescido por origem
+ * a cada 350 ms — um pedido serve todos os viewers do mesmo slot.
  */
-function requestKeyframe(entry, { urgente = false } = {}) {
+function requestKeyframe(entry, transicaoRtc = false, recuperacaoRelay = false) {
   const agora = Date.now();
-  // A pressa é para quem ficou sem nenhuma imagem, e não para quem está com a
-  // conexão apertada: voltar da conexão direta para o relay deixa o
-  // decodificador frio, e esperar o intervalo custaria segundos de tela parada.
-  // O recado é barato — do outro lado ele só levanta uma bandeira, e levantá-la
-  // duas vezes é o mesmo que levantá-la uma.
-  if (!urgente && agora - (entry.lastKeyframeAsk ?? 0) < KEYFRAME_ASK_EVERY_MS) return;
+  // Toda origem do pedido, inclusive a volta do RTC, passa pelo mesmo freio.
+  // A primeira volta do RTC pode ultrapassar um pedido anterior do relay: o
+  // decoder acabou de trocar de fonte e precisa de um ponto de partida novo.
+  // A exceção é consumida uma vez por segundo; alternar rtc-ativo não abre uma
+  // torneira de controles nem contorna o limite indefinidamente.
+  if (
+    entry.lastKeyframeAsk !== undefined &&
+    agora - entry.lastKeyframeAsk < KEYFRAME_ASK_EVERY_MS
+  ) {
+    const rtcPodeUltrapassar =
+      transicaoRtc &&
+      (entry.lastRtcKeyframeAsk === undefined ||
+        agora - entry.lastRtcKeyframeAsk >= KEYFRAME_ASK_EVERY_MS);
+    const recoveryPodeUltrapassar =
+      recuperacaoRelay &&
+      (entry.lastRecoveryKeyframeAsk === undefined ||
+        agora - entry.lastRecoveryKeyframeAsk >= KEYFRAME_RECOVERY_ASK_EVERY_MS);
+    if (!rtcPodeUltrapassar && !recoveryPodeUltrapassar) return false;
+  }
+  if (transicaoRtc) entry.lastRtcKeyframeAsk = agora;
+  if (recuperacaoRelay) entry.lastRecoveryKeyframeAsk = agora;
   entry.lastKeyframeAsk = agora;
   sendJson(entry.ws, { type: 'need-keyframe' });
+  return true;
 }
 
 export function rename(room, ws, raw) {
@@ -596,6 +882,21 @@ function freeSlot(room) {
 /** Retorna a entry criada, ou uma string com o motivo da recusa. */
 export function attachBroadcaster(room, ws, info, fonte = 'tela') {
   const chave = chaveDe(info.id, fonte);
+  const existing = room.broadcasters.get(chave);
+
+  if (existing?.reconnectUntil && existing.reconnectUntil >= Date.now()) {
+    clearTimeout(existing.reconnectTimer);
+    existing.reconnectTimer = null;
+    existing.reconnectUntil = null;
+    existing.ws = ws;
+    existing.connectedAt = Date.now();
+    ws.__entry = existing;
+    ws.__resumedBroadcaster = true;
+    room.emptySince = null;
+    sendJson(ws, { type: 'slot', slot: existing.slot });
+    broadcastState(room);
+    return existing;
+  }
 
   // A recusa nomeia a fonte: "você já está transmitindo" era claro quando só
   // havia uma, mas com duas deixaria a pessoa sem saber qual delas repetiu.
@@ -632,6 +933,21 @@ export function attachBroadcaster(room, ws, info, fonte = 'tela') {
     // undefined = nunca dito. Vira true/false no primeiro espectador, e é o que
     // impede o servidor de repetir o mesmo recado a cada entrada e saída.
     chunksLigados: undefined,
+    rtcChunksLastAt: undefined,
+    chunksTimer: null,
+    // Estimador de taxa da transmissão, trocado a cada `startStream`.
+    taxa: estimadorTaxa(),
+    // Espelho do estado reportado pelo transmissor. O servidor não conta.
+    degraus: 0,
+    noPiso: false,
+    qualidade: null,
+    janelasLimpas: 0,
+    ultimoAjuste: Date.now(),
+    ultimaPressaoTransporte: null,
+    pressaoTransporteDesde: null,
+    pressaoTransporteEventos: 0,
+    reconnectTimer: null,
+    reconnectUntil: null,
   };
   room.broadcasters.set(chave, entry);
   room.slots.set(slot, entry);
@@ -648,10 +964,22 @@ export function startStream(room, entry) {
   entry.startedAt = Date.now();
   entry.config = null;
   entry.audioConfig = null;
+  // Transmissão nova, dívida nenhuma: nem a qualidade herdada da anterior, nem
+  // a taxa medida dela — inclusive quando as duas caem no mesmo segundo.
+  entry.taxa = estimadorTaxa(entry.startedAt);
+  entry.degraus = 0;
+  entry.noPiso = false;
+  entry.qualidade = null;
+  entry.janelasLimpas = 0;
+  entry.ultimoAjuste = entry.startedAt;
+  entry.ultimaPressaoTransporte = null;
+  entry.pressaoTransporteDesde = null;
+  entry.pressaoTransporteEventos = 0;
   // Transmissão nova recomeça do zero: ninguém assiste até pedir.
   for (const v of room.viewers) {
     v.__primed?.delete(entry.slot);
     v.__watching?.delete(entry.slot);
+    v.__descartes?.delete(entry.slot);
   }
   toViewers(room, {
     type: 'stream-start',
@@ -659,6 +987,19 @@ export function startStream(room, entry) {
     userId: entry.info.id,
     fonte: entry.fonte,
   });
+  broadcastState(room);
+}
+
+/** Retoma uma stream preservada sem apagar watches nem reciclar o slot. */
+export function resumeStream(room, entry) {
+  if (!entry.streaming) {
+    startStream(room, entry);
+    return;
+  }
+  entry.connectedAt = Date.now();
+  entry.ultimaPressaoTransporte = null;
+  entry.pressaoTransporteDesde = null;
+  entry.pressaoTransporteEventos = 0;
   broadcastState(room);
 }
 
@@ -687,17 +1028,72 @@ export function setConfig(room, entry, config) {
   }
 }
 
+/** Um descarte na janela corrente do sweeper, contado por espectador e slot. */
+function contarDescarte(v, slot) {
+  if (!v.__descartes) v.__descartes = new Map();
+  const total = (v.__descartes.get(slot) ?? 0) + 1;
+  v.__descartes.set(slot, total);
+  return total;
+}
+
 export function pushChunk(room, entry, chunk) {
   const bytes = Number(chunk?.byteLength ?? chunk?.length ?? 0);
+
+  // A validação vem ANTES de qualquer contabilização: byte rejeitado não é
+  // mídia. Contá-lo primeiro deixava um transmissor inflar a própria taxa — e
+  // com ela o próprio orçamento — despejando buffers carimbados com slot
+  // alheio, que o relay descarta mas registrava.
+  if (chunk[SLOT_BYTE] !== entry.slot) return;
+
+  const agora = Date.now();
+
+  // A taxa é lida ANTES de o chunk entrar no estimador: o item em julgamento
+  // não financia o próprio julgamento. Sem isto, um pico se autoriza sozinho.
+  const taxa = taxaDoOrcamento(entry, agora);
+  const orcamento = taxa === null ? BOOTSTRAP_BYTES : taxa * MAX_FILA_SEGUNDOS;
+  const tetoKeyframe = taxa === null ? null : taxa * TETO_KEYFRAME_SEGUNDOS;
+
   recordTraffic(appTraffic, 'receivedBytes', bytes);
   recordTraffic(room.traffic, 'receivedBytes', bytes);
   recordTraffic(entry.traffic, 'receivedBytes', bytes);
-
-  if (chunk[SLOT_BYTE] !== entry.slot) return;
+  registrarTaxa(entry.taxa, bytes, agora);
 
   const tipo = chunk[TYPE_BYTE];
   const isKeyframe = tipo === KEYFRAME;
   const isAudio = tipo === AUDIO;
+
+  // A pergunta não é "a fila dele JÁ passou do limite?", e sim "a fila FICA
+  // passando do limite se eu mandar isto?". Com a primeira, um único quadro
+  // grande entrava inteiro numa fila vazia e punha segundos de mídia no socket
+  // — o teto nunca limitava o que estava entrando, só o que já estava lá.
+  const cabe = (v, limite) => v.bufferedAmount + bytes <= limite;
+
+  // No WebTransport, delta e audio seguem como datagramas por uma fila que ja
+  // tem limites proprios de quantidade, bytes e idade. Reaplicar aqui o teto
+  // de bufferedAmount do WebSocket descartava antes dessa fila cancelavel e
+  // transformava pressao transitoria em uma longa espera por keyframe. O
+  // keyframe continua confiavel e conserva a politica atomica logo abaixo.
+  const cabeDatagrama = (v) => v.transport === 'webtransport' || cabe(v, orcamento);
+
+  // Keyframe tem política própria e atômica: passa pelo teto comum de 2×, ou —
+  // com o socket COMPLETAMENTE drenado — por um teto em tempo só dele. É o que
+  // mantém a recuperação possível em bitrate baixo, onde um keyframe sozinho
+  // vale mais que a fila inteira. Admitido o keyframe grande, a mídia seguinte
+  // fica bloqueada até drenar pela regra ordinária, sem código a mais.
+  const cabeKeyframe = (v) => {
+    if (cabe(v, orcamento * 2)) return true;
+    if (tetoKeyframe === null || bytes > tetoKeyframe) return false;
+    if (v.bufferedAmount === 0) return true;
+
+    // O adapter WebTransport aposenta os deltas pendentes da lane ANTES de
+    // admitir um keyframe. Rooms precisa deixar essa ancora chegar ao adapter:
+    // julgar apenas o bufferedAmount anterior rejeitaria justamente o frame que
+    // esvazia a fila. A excecao vale somente para decoder frio e conserva o teto
+    // atomico de tempo; WebSocket continua sem ela porque nao consegue cancelar
+    // bytes que ja estao no socket TCP.
+    return v.transport === 'webtransport' && !v.__primed.has(entry.slot);
+  };
+
   let sentCopies = 0;
   let droppedCopies = 0;
 
@@ -715,10 +1111,11 @@ export function pushChunk(room, entry, chunk) {
     // Áudio não depende de keyframe — cada pacote Opus se decodifica sozinho —,
     // então não passa pelo controle de "já recebeu ponto de partida".
     if (isAudio) {
-      if (v.bufferedAmount > MAX_BUFFERED_BYTES) {
+      if (!cabeDatagrama(v)) {
         room.droppedChunks++;
         entry.droppedChunks++;
         droppedCopies++;
+        contarDescarte(v, entry.slot);
         continue;
       }
       v.send(chunk);
@@ -728,10 +1125,11 @@ export function pushChunk(room, entry, chunk) {
     }
 
     if (isKeyframe) {
-      if (v.bufferedAmount > MAX_BUFFERED_BYTES * 2) {
+      if (!cabeKeyframe(v)) {
         room.droppedChunks++;
         entry.droppedChunks++;
         droppedCopies++;
+        contarDescarte(v, entry.slot);
         // Sem este keyframe ele continua sem ponto de partida. Pedir outro é o
         // que evita a espera pelo periódico, que é de segundos.
         requestKeyframe(entry);
@@ -746,10 +1144,11 @@ export function pushChunk(room, entry, chunk) {
 
     if (!v.__primed.has(entry.slot)) continue;
 
-    if (v.bufferedAmount > MAX_BUFFERED_BYTES) {
+    if (!cabeDatagrama(v)) {
       room.droppedChunks++;
       entry.droppedChunks++;
       droppedCopies++;
+      contarDescarte(v, entry.slot);
 
       // Um delta perdido quebra a cadeia de referência: daqui em diante o
       // decoder dele descarta tudo até chegar um keyframe. Continuar mandando
@@ -776,14 +1175,25 @@ export function pushChunk(room, entry, chunk) {
 
 export function stopStream(room, entry) {
   if (!entry.streaming) return;
+  clearTimeout(entry.chunksTimer);
+  entry.chunksTimer = null;
   entry.streaming = false;
   entry.startedAt = null;
   entry.config = null;
   entry.audioConfig = null;
+  entry.degraus = 0;
+  entry.noPiso = false;
+  entry.qualidade = null;
+  entry.janelasLimpas = 0;
+  entry.ultimoAjuste = Date.now();
+  entry.ultimaPressaoTransporte = null;
+  entry.pressaoTransporteDesde = null;
+  entry.pressaoTransporteEventos = 0;
   for (const v of room.viewers) {
     v.__primed?.delete(entry.slot);
     v.__watching?.delete(entry.slot);
     v.__rtc?.delete(entry.slot);
+    v.__descartes?.delete(entry.slot);
   }
   entry.chunksLigados = undefined;
   toViewers(room, { type: 'stream-stop', slot: entry.slot });
@@ -791,12 +1201,44 @@ export function stopStream(room, entry) {
 
 export function detachBroadcaster(room, ws) {
   const entry = ws.__entry;
-  if (!entry || room.broadcasters.get(entry.chave) !== entry) return;
+  if (!entry || room.broadcasters.get(entry.chave) !== entry || entry.ws !== ws) return;
 
+  clearTimeout(entry.reconnectTimer);
+  entry.reconnectTimer = null;
+  entry.reconnectUntil = null;
+  clearTimeout(entry.chunksTimer);
+  entry.chunksTimer = null;
   stopStream(room, entry);
   room.broadcasters.delete(entry.chave);
   room.slots.delete(entry.slot);
   broadcastState(room);
+}
+
+/**
+ * Conserva uma transmissão durante uma queda curta do transporte.
+ * Retorna true quando entrou em carência; false quando a entrada foi removida.
+ */
+export function suspendBroadcaster(room, ws) {
+  const entry = ws.__entry;
+  if (
+    !entry ||
+    room.broadcasters.get(entry.chave) !== entry ||
+    entry.ws !== ws ||
+    !entry.streaming
+  ) {
+    detachBroadcaster(room, ws);
+    return false;
+  }
+
+  clearTimeout(entry.reconnectTimer);
+  entry.reconnectUntil = Date.now() + BROADCASTER_RECONNECT_GRACE_MS;
+  entry.reconnectTimer = setTimeout(() => {
+    if (entry.ws === ws && entry.reconnectUntil && entry.reconnectUntil <= Date.now()) {
+      detachBroadcaster(room, ws);
+    }
+  }, BROADCASTER_RECONNECT_GRACE_MS);
+  entry.reconnectTimer.unref?.();
+  return true;
 }
 
 // --------------------------------------------------------------- espectador
@@ -815,6 +1257,16 @@ export function watch(room, ws, slot) {
   if (entry.audioConfig) {
     sendJson(ws, { type: 'audio-config', slot, config: entry.audioConfig });
   }
+  if (entry.qualidade) {
+    sendJson(ws, {
+      type: 'quality-state',
+      slot,
+      degraus: entry.degraus,
+      bitrate: entry.qualidade.bitrate,
+      fps: entry.qualidade.fps,
+      piso: entry.noPiso,
+    });
+  }
   requestKeyframe(entry);
 
   // Convida o transmissor a abrir uma conexão direta com este espectador. É só
@@ -826,10 +1278,116 @@ export function watch(room, ws, slot) {
   broadcastState(room);
 }
 
+/**
+ * O espectador ficou sem ponto de partida e pede um novo.
+ *
+ * Quem descobre o buraco é o transporte dele: o relay entrega o que recebe e
+ * não sabe que a cadeia de referência quebrou no meio do caminho. Sem esta
+ * porta, um espectador que perdeu o keyframe ficava com a tela parada até o
+ * próximo periódico — segundos, não quadros.
+ *
+ * É entrada externa, validada aqui na fronteira e em nenhum outro lugar:
+ * - slot inteiro e dentro da faixa que a sala pode ter;
+ * - transmissão existente e no ar;
+ * - o pedinte assiste ESTE slot — senão qualquer espectador cobraria keyframe
+ *   de uma transmissão que nem pediu, e o custo cairia na sala inteira;
+ * - e não está pela conexão direta, onde o relay não é a origem da imagem.
+ *
+ * O pedido passa pelo mesmo freio de um por segundo do resto do módulo: quem
+ * pede é justamente quem já está com a conexão apertada.
+ */
+export function pedirKeyframe(room, ws, slot) {
+  if (!Number.isInteger(slot) || slot < 0 || slot >= MAX_BROADCASTERS) return false;
+  const entry = room.slots.get(slot);
+  if (!entry || !entry.streaming) return false;
+  if (!ws.__watching?.has(slot)) return false;
+  if (ws.__rtc?.has(slot)) return false;
+
+  // Ele já sabe que o decodificador está frio; o servidor precisa saber também,
+  // senão continuaria despejando deltas indecifráveis até o keyframe chegar.
+  ws.__primed?.delete(slot);
+  // Buraco detectado pelo wire é descarte real do relay, mesmo quando a fila
+  // JS já drenou. Sem alimentar a mesma janela de qualidade, perdas nativas de
+  // datagrama pediam keyframe, mas o encoder continuava em 2,5 Mb/s contra um
+  // caminho degradado e recriava o buraco indefinidamente.
+  const perdasNaJanela = contarDescarte(ws, slot);
+  // O wire enxerga perda nativa a cada poucos centésimos; esperar o sweeper de
+  // quatro segundos fazia a escada ceder devagar demais para uma rampa real.
+  // O mesmo cooldown global continua limitando a uma redução a cada 2 s.
+  if (perdasNaJanela >= PERDAS_WIRE_PARA_DEGRADAR) {
+    reduzirQualidade(
+      entry,
+      Date.now(),
+      passosPorSeveridade(perdasNaJanela, PERDAS_WIRE_PARA_DEGRADAR),
+    );
+  }
+  requestKeyframe(entry, false, true);
+  return true;
+}
+
+/**
+ * Reage ao sinal de congestionamento que só o QUIC nativo consegue observar.
+ *
+ * `expiredOutgoing` não é perda aleatória: o datagrama passou do próprio teto
+ * de frescor antes de sair. Esperar o viewer detectar um buraco e o sweeper
+ * acumular descartes adicionava segundos ao laço. Três eventos em uma janela
+ * curta confirmam a pressão sem deixar um espúrio do preflight derrubar a
+ * qualidade inteira; a reação preserva o cooldown global e só afeta
+ * transmissões que este socket realmente assiste pelo relay.
+ */
+export function reportarPressaoTransporte(room, ws, diagnostic) {
+  const reason = diagnostic?.reason;
+  const expiracaoNativa = reason === 'datagram-native-expired';
+  const perdaNativa = reason === 'datagram-native-lost';
+  const writerSemCredito = reason === 'datagram-blocked' || reason === 'datagram-expired';
+  if (!expiracaoNativa && !perdaNativa && !writerSemCredito) return 0;
+  if (expiracaoNativa && !(Number(diagnostic.newlyExpired) > 0)) return 0;
+  if (perdaNativa && !(Number(diagnostic.newlyLost) > 0)) return 0;
+  const eventos = expiracaoNativa
+    ? Number(diagnostic.newlyExpired)
+    : perdaNativa
+      ? Number(diagnostic.newlyLost)
+      : 1;
+
+  let afetadas = 0;
+  const now = Date.now();
+  for (const slot of ws.__watching ?? []) {
+    if (ws.__rtc?.has(slot)) continue;
+    const entry = room.slots.get(slot);
+    if (!entry?.streaming) continue;
+    if (
+      Number.isFinite(entry.ultimaPressaoTransporte) &&
+      now - entry.ultimaPressaoTransporte < DOWN_COOLDOWN_MS
+    ) {
+      continue;
+    }
+    if (
+      !Number.isFinite(entry.pressaoTransporteDesde) ||
+      now - entry.pressaoTransporteDesde > JANELA_PRESSAO_TRANSPORTE_MS
+    ) {
+      entry.pressaoTransporteDesde = now;
+      entry.pressaoTransporteEventos = 0;
+    }
+    entry.pressaoTransporteEventos += eventos;
+    if (entry.pressaoTransporteEventos < PRESSAO_TRANSPORTE_PARA_EMERGENCIA) continue;
+    entry.pressaoTransporteDesde = null;
+    entry.pressaoTransporteEventos = 0;
+    // A pressão do writer/nativo não compete com o cooldown do sweeper. Se o
+    // sweep acabou de pedir um degrau, o corte físico ainda precisa atravessar;
+    // apenas sinais emergenciais entre si compartilham o freio de 2 s.
+    if (reduzirQualidade(entry, now, PASSOS_PRESSAO_NATIVA, { urgente: true })) {
+      entry.ultimaPressaoTransporte = now;
+      afetadas++;
+    }
+  }
+  return afetadas;
+}
+
 export function unwatch(room, ws, slot) {
   // Só avisa a sala se algo mudou de fato; ver a nota em watch().
   if (!ws.__watching.delete(slot)) return;
   ws.__primed.delete(slot);
+  ws.__descartes?.delete(slot);
   encerrarPeer(room, ws, slot);
   broadcastState(room);
 }
@@ -875,16 +1433,22 @@ export function rtcAtivo(room, ws, slot, ativo) {
   const entry = room.slots.get(slot);
   if (!entry || !ws.__watching?.has(slot)) return;
 
-  if (ativo) ws.__rtc.add(slot);
-  else {
+  if (ativo) {
+    if (ws.__rtc.has(slot)) return;
+    ws.__rtc.add(slot);
+    // O que ele sofreu no relay morre aqui junto com o relay dele: contar isso
+    // contra a qualidade da sala seria cobrar de todo mundo por uma fila que
+    // ninguém mais está consumindo.
+    ws.__descartes?.delete(slot);
+  } else {
     if (!ws.__rtc.delete(slot)) return;
     // Voltando ao relay, o decoder dele está frio: sem keyframe novo ele
     // descartaria tudo até o periódico, que é de segundos.
     ws.__primed.delete(slot);
-    requestKeyframe(entry, { urgente: true });
+    requestKeyframe(entry, true);
   }
 
-  atualizarChunks(room, entry);
+  atualizarChunksRtc(room, entry);
 }
 
 /** Desfaz a conexão direta de um espectador com um slot, dos dois lados. */
@@ -916,7 +1480,27 @@ function atualizarChunks(room, entry) {
   entry.chunksLigados = ligado;
   sendJson(entry.ws, { type: 'chunks', on: ligado });
   // Religar o relay sem ponto de partida entregaria só deltas indecifráveis.
-  if (ligado) requestKeyframe(entry, { urgente: true });
+  if (ligado) requestKeyframe(entry);
+}
+
+function atualizarChunksRtc(room, entry) {
+  const agora = Date.now();
+  const desde = agora - (entry.rtcChunksLastAt ?? -Infinity);
+  if (!entry.chunksTimer && desde >= CHUNKS_DEBOUNCE_MS) {
+    entry.rtcChunksLastAt = agora;
+    atualizarChunks(room, entry);
+    return;
+  }
+
+  if (entry.chunksTimer) return;
+  entry.chunksTimer = setTimeout(
+    () => {
+      entry.chunksTimer = null;
+      entry.rtcChunksLastAt = Date.now();
+      atualizarChunks(room, entry);
+    },
+    Math.max(0, CHUNKS_DEBOUNCE_MS - desde),
+  );
 }
 
 export function attachViewer(room, ws, info) {
@@ -925,6 +1509,10 @@ export function attachViewer(room, ws, info) {
   // Slots que já chegam por WebRTC. Enquanto o slot está aqui, o relay não
   // manda os bytes dele para este espectador — seria o mesmo vídeo duas vezes.
   ws.__rtc = new Set();
+  // Descartes deste espectador na janela corrente do sweeper, por slot. É a
+  // evidência de congestionamento, e é por espectador porque a decisão precisa
+  // distinguir "um sofrendo" de "dois quase bem".
+  ws.__descartes = new Map();
   ws.__peerId ??= `p${proximoPeerId++}`;
   ws.__info = info;
   ws.__connectedAt = ws.__connectedAt ?? Date.now();

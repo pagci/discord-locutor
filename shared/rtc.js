@@ -56,13 +56,43 @@ export function suportaWebRTC() {
  * Cria a conexão e liga os avisos. Quem chama decide o que fazer com eles —
  * este módulo não conhece nem sala, nem slot, nem sinalização.
  */
-export function criarPeer({ ice, onIce, onEstado, onTrack }) {
+export function politicaIceDaUrl(search = globalThis.location?.search ?? '') {
+  try {
+    return new URLSearchParams(search).get('rtcPolicy') === 'relay' ? 'relay' : 'all';
+  } catch {
+    return 'all';
+  }
+}
+
+export function criarPeer({ ice, onIce, onEstado, onTrack, iceTransportPolicy = 'all' }) {
   const pc = new RTCPeerConnection({
     iceServers: ice ?? ICE_PADRAO,
+    iceTransportPolicy,
     // Junta áudio e vídeo num transporte só. Sem isso são duas negociações de
     // ICE para a mesma conexão, e o dobro de tempo até o primeiro quadro.
     bundlePolicy: 'max-bundle',
   });
+
+  if (iceTransportPolicy === 'relay') {
+    const diagnostic = { pc, events: [] };
+    globalThis.__ENSAIO_RTC_DIAGNOSTICS ??= [];
+    globalThis.__ENSAIO_RTC_DIAGNOSTICS.push(diagnostic);
+    pc.addEventListener('icecandidate', (event) =>
+      diagnostic.events.push({
+        type: 'candidate',
+        candidate: event.candidate?.candidate ?? null,
+        url: event.candidate?.url ?? null,
+      }),
+    );
+    pc.addEventListener('icecandidateerror', (event) =>
+      diagnostic.events.push({
+        type: 'candidate-error',
+        url: event.url,
+        code: event.errorCode,
+        text: event.errorText,
+      }),
+    );
+  }
 
   pc.addEventListener('icecandidate', (e) => {
     // O candidato nulo é o fim da lista, não um candidato — repassá-lo faria o
@@ -127,7 +157,7 @@ export async function ajustarEnvio(pc, { bitrate, fonte = 'tela', fps } = {}) {
  */
 export async function resumoPeer(pc) {
   let rtt = null;
-  let relay = false;
+  let relay = null;
 
   try {
     const stats = await pc.getStats();
@@ -139,7 +169,7 @@ export async function resumoPeer(pc) {
         if (typeof s.currentRoundTripTime === 'number')
           rtt = Math.round(s.currentRoundTripTime * 1000);
         const local = porId.get(s.localCandidateId);
-        if (local?.candidateType === 'relay') relay = true;
+        if (local?.candidateType) relay = local.candidateType === 'relay';
       }
     }
   } catch {

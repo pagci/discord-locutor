@@ -1,4 +1,12 @@
-import { iceServers, criarPeer, ajustarEnvio, suportaWebRTC, MORTO } from './rtc.js';
+import {
+  iceServers,
+  criarPeer,
+  ajustarEnvio,
+  suportaWebRTC,
+  MORTO,
+  politicaIceDaUrl,
+} from './rtc.js';
+import { createTransport } from './transport.js';
 
 /**
  * Pipeline de transmissão: captura → codifica → envia.
@@ -53,6 +61,11 @@ const NIVEIS_H264 = [
  * é o que roda onde nada mais roda.
  */
 const PERFIS_H264 = ['6400', '4d40', '42e0'];
+
+// Uma queda curta de QUIC não encerra a captura. O servidor conserva o slot
+// durante a mesma janela e este lado tenta de novo com backoff curto.
+const RECONNECT_INITIAL_MS = 100;
+const RECONNECT_MAX_MS = 1000;
 
 /** O menor nível que aguenta este quadro nesta taxa. */
 export function nivelH264(width, height, fps) {
@@ -111,6 +124,11 @@ const GRADE_PERDIDA = 4;
 
 // Keyframe periódico: seguro barato para quem reconecta fora do fluxo normal.
 const KEYFRAME_EVERY_MS = 3000;
+// No piso degradado, o pedido de recuperação do receptor já chega em 150 ms e
+// se repete enquanto o gap existir. O periódico vira apenas rede de segurança:
+// cinco segundos cobrem uma perda de feedback sem competir com cada delta.
+const KEYFRAME_DEGRADED_EVERY_MS = 5000;
+const KEYFRAME_EMERGENCY_EVERY_MS = 5000;
 
 // Tipos do primeiro byte útil de cada pacote. O áudio anda pelo mesmo socket e
 // pelo mesmo cabeçalho do vídeo: um canal só, um formato só, e o servidor
@@ -119,19 +137,38 @@ const TIPO_KEYFRAME = 1;
 const TIPO_DELTA = 2;
 const TIPO_AUDIO = 3;
 
-// 96 kbps em Opus estéreo é transparente para som de aplicativo e de vídeo, e é
-// ruído perto dos megabits do vídeo — não vale economizar aqui.
+// 96 kbps em Opus estéreo é transparente para som de aplicativo e de vídeo.
+// Só o piso emergencial reduz isso: ali cada bit compete com o quadro seguinte.
 const AUDIO_BITRATE = 96_000;
+// Reserva margem para vídeo+FEC nas duas pernas do relay congestionado.
+const AUDIO_BITRATE_EMERGENCIA = 32_000;
 
 // Teto de resolução: acima disso banda e CPU disparam sem ganho de legibilidade.
 // A imagem é reduzida proporcionalmente, nunca cortada.
-const MAX_W = 1920;
 const MAX_H = 1080;
+const RESOLUCOES = new Set([480, 720, 1080]);
 
 const even = (n) => Math.max(2, n - (n % 2));
 
-function fitWithin(w, h) {
-  const scale = Math.min(1, MAX_W / w, MAX_H / h);
+export function escalaResolucaoAdaptativa(tetoBitrate, bitrate) {
+  const ratio = Number(bitrate) / Math.max(1, Number(tetoBitrate));
+  if (!Number.isFinite(ratio) || ratio >= 0.6) return 1;
+  if (ratio >= 0.3) return 0.67;
+  if (ratio >= 0.16) return 0.5;
+  if (ratio >= 0.08) return 0.35;
+  if (ratio >= 0.04) return 0.25;
+  return 0.15;
+}
+
+function normalizarResolucao(valor) {
+  const resolucao = Number(valor);
+  return RESOLUCOES.has(resolucao) ? resolucao : MAX_H;
+}
+
+function fitWithin(w, h, qualityScale = 1, resolution = MAX_H) {
+  const maxH = normalizarResolucao(resolution);
+  const maxW = Math.round((maxH * 16) / 9);
+  const scale = Math.min(1, maxW / w, maxH / h) * qualityScale;
   return { width: even(Math.round(w * scale)), height: even(Math.round(h * scale)) };
 }
 
@@ -215,16 +252,83 @@ export function fonteIndisponivel(fonte) {
 }
 
 /**
+ * Piso de emergência da escada automática.
+ *
+ * O relay de teste atravessa o mesmo enlace de 600 kb/s na subida e na
+ * descida; 300 kb/s por trecho já consumia 100% antes de QUIC, áudio e FEC e
+ * tornava a recuperação matematicamente impossível. Em rede saudável o teto
+ * continua intacto. Este piso só aparece depois de treze provas de degradação,
+ * junto da escala espacial de 15% e do áudio a 32 kb/s. Assim o pior caso com
+ * FEC cabe com margem no enlace e preserva movimento antes de ceder FPS.
+ */
+const PISO_BITRATE = 60_000;
+
+export function intervaloKeyframeAdaptativo(bitrateEfetivo) {
+  const atual = Number(bitrateEfetivo);
+  if (atual <= PISO_BITRATE) return KEYFRAME_EMERGENCY_EVERY_MS;
+  if (atual <= PISO_BITRATE * 2) return KEYFRAME_DEGRADED_EVERY_MS;
+  return KEYFRAME_EVERY_MS;
+}
+
+/** Degraus de taxa de quadros, do maior para o menor. O piso é 15. */
+const DEGRAUS_FPS = [60, 30, 24, 18, 15];
+
+/**
+ * A qualidade efetiva depois de N reduções automáticas a partir do teto.
+ *
+ * O teto é a escolha da pessoa na engrenagem, e esta função só sabe DESCER a
+ * partir dele — é por isso que o automático não tem como ultrapassar a escolha
+ * manual: não existe caminho de código que suba acima da entrada. Guardar o
+ * efetivo em paralelo permitiria essa divergência; derivá-lo de (teto, degraus)
+ * a elimina por construção.
+ *
+ * Bitrate primeiro, taxa de quadros depois: metade dos bits ainda dá imagem
+ * inteira, enquanto metade dos quadros é movimento aos solavancos. Só quando o
+ * bitrate encosta no piso é que a taxa começa a ceder.
+ */
+export function qualidadeComDegraus({ bitrate, fps }, degraus) {
+  let efetivoBitrate = bitrate;
+  let efetivoFps = fps;
+
+  for (let i = 0; i < degraus; i++) {
+    if (efetivoBitrate > PISO_BITRATE) {
+      efetivoBitrate = Math.max(PISO_BITRATE, Math.round(efetivoBitrate * 0.75));
+      continue;
+    }
+    // Nunca acima do que a pessoa escolheu: a escada começa no teto dela.
+    const abaixo = DEGRAUS_FPS.find((valor) => valor < efetivoFps && valor <= fps);
+    if (abaixo === undefined) break;
+    efetivoFps = abaixo;
+  }
+
+  return { bitrate: efetivoBitrate, fps: efetivoFps };
+}
+
+/** O degrau em que a escada deste teto para de mudar de valor. */
+function degrausAteSaturar(teto) {
+  let anterior = qualidadeComDegraus(teto, 0);
+  for (let n = 1; n <= 64; n++) {
+    const atual = qualidadeComDegraus(teto, n);
+    if (atual.bitrate === anterior.bitrate && atual.fps === anterior.fps) return n - 1;
+    anterior = atual;
+  }
+  return 64;
+}
+
+/**
  * @param {object} opts
  * @param {string} opts.wsUrl        endpoint do relay, com o token de transmissor
  * @param {number} opts.bitrate      bits por segundo
  * @param {number} opts.fps
+ * @param {480|720|1080} [opts.resolution] teto vertical escolhido pela pessoa
  * @param {boolean} [opts.audio]     capturar também o som do computador
  * @param {'tela'|'camera'} [opts.fonte]  de onde vem o vídeo
  * @param {(info:object)=>void} [opts.onStatus]  codec/resolução/caminho de captura
  * @param {(stats:object)=>void} [opts.onStats]  viewers, fps, mbps, segundos no ar
  * @param {(reason:string)=>void} [opts.onEnd]   encerrou (por qualquer motivo)
  * @param {(msg:string)=>void} [opts.onAviso]    algo mudou sem ser erro
+ * @param {(info:object)=>void} [opts.onTransport] transporte lógico selecionado
+ * @param {(info:object)=>void} [opts.onDiagnostic] diagnóstico sanitizado de fallback
  */
 export function createBroadcaster({
   wsUrl,
@@ -233,6 +337,7 @@ export function createBroadcaster({
   apiBase = '',
   bitrate,
   fps,
+  resolution = MAX_H,
   audio = false,
   fonte = 'tela',
   // Stream já aberto pela prévia. Reaproveitá-lo é o que evita abrir o seletor
@@ -244,12 +349,15 @@ export function createBroadcaster({
   onStats,
   onEnd,
   onAviso,
+  onTransport,
+  onDiagnostic,
 }) {
   let ws = null;
   let stream = null;
   let encoder = null;
   let reader = null;
   let audioEncoder = null;
+  let audioConfig = null;
   let audioReader = null;
   // Pediram som, mas a superfície escolhida traria o Discord junto. Guardado
   // para a interface poder oferecer a saída em vez de só avisar e esquecer.
@@ -262,14 +370,23 @@ export function createBroadcaster({
   // Uma conexão direta por espectador. O servidor nomeia cada um; aqui o nome
   // é só a chave — quem é a pessoa não interessa para negociar transporte.
   const peers = new Map(); // peerId -> RTCPeerConnection
+  // Trickle ICE pode chegar enquanto setRemoteDescription(answer) ainda está
+  // pendente. addIceCandidate rejeita nesse intervalo; guardar por peer evita
+  // perder justamente o candidato relay que pode ser o único caminho possível.
+  const icePendentes = new Map(); // peerId -> RTCIceCandidateInit[]
+  const remotaPronta = new WeakSet();
   // Quadros ainda precisam subir pelo relay? Falso só quando todo mundo que
   // assiste está na conexão direta, e o servidor é quem sabe disso.
   let enviarChunks = true;
   // Antes do primeiro config, pausar deixaria quem chegasse depois sem como
   // montar o decodificador: o servidor guarda o config, mas só depois de vê-lo.
   let configEnviada = false;
+  let videoConfig = null;
 
   let running = false;
+  let reconnectTimer = null;
+  let reconnecting = false;
+  let reconnectDelay = RECONNECT_INITIAL_MS;
   let mySlot = 0;
   let wantKeyframe = true;
   let lastKeyframeAt = 0;
@@ -290,6 +407,41 @@ export function createBroadcaster({
   let viewers = 0;
   let statsTimer = null;
 
+  // O teto é a escolha da pessoa; `degraus` é quanto a rede pediu para ceder
+  // abaixo dele. A qualidade que vai ao ar é sempre derivada dos dois, nunca
+  // guardada em paralelo — é o que impede o automático de ultrapassar o manual.
+  let teto = { bitrate, fps, resolution: normalizarResolucao(resolution) };
+  let degraus = 0;
+
+  const efetivo = () => qualidadeComDegraus(teto, degraus);
+  const noPiso = () => degraus >= degrausAteSaturar(teto);
+  const bitrateAudioEfetivo = () =>
+    degraus > 0 && efetivo().bitrate <= PISO_BITRATE * 2 ? AUDIO_BITRATE_EMERGENCIA : AUDIO_BITRATE;
+  const alvoDeResolucao = (width, height) =>
+    fitWithin(width, height, escalaResolucaoAdaptativa(teto.bitrate, bitrate), teto.resolution);
+
+  /**
+   * Conta ao servidor o estado real da qualidade.
+   *
+   * O servidor não mantém contador próprio: ele espelha isto. Sem o snapshot,
+   * os dois lados teriam a mesma escada escrita duas vezes, livres para
+   * divergir — e a divergência apareceria como dívida de `quality-up` que nunca
+   * fecha, ou como `quality-down` insistindo em quem já está no piso.
+   */
+  function relatarQualidade() {
+    if (ws?.readyState !== WebSocket.OPEN) return;
+    const atual = efetivo();
+    ws.send(
+      JSON.stringify({
+        type: 'quality',
+        degraus,
+        bitrate: atual.bitrate,
+        fps: atual.fps,
+        piso: noPiso(),
+      }),
+    );
+  }
+
   async function start() {
     // Precisa vir do gesto do usuário; qualquer await antes disso o invalida.
     // A prévia já pagou esse preço, então quando ela existe não há o que pedir.
@@ -308,7 +460,7 @@ export function createBroadcaster({
     );
 
     const s = track.getSettings();
-    const target = fitWithin(s.width ?? 1280, s.height ?? 720);
+    const target = alvoDeResolucao(s.width ?? 1280, s.height ?? 720);
 
     config = await pickConfig(target.width, target.height);
     if (!config) {
@@ -325,6 +477,14 @@ export function createBroadcaster({
     encoder.configure(config);
 
     ws.send(JSON.stringify({ type: 'start' }));
+
+    // O snapshot inicial vai depois do `start` e ANTES do primeiro binário, e a
+    // ordem é o ponto: sem ele o relay ainda não conhece a taxa desta stream,
+    // trata a janela fria pelo bootstrap em bytes e recusa o primeiro keyframe
+    // legítimo — que numa tela 1080p passa de centenas de KB. Chegando depois
+    // do primeiro chunk, não salvaria o keyframe que veio antes dele.
+    degraus = 0;
+    relatarQualidade();
 
     running = true;
     wantKeyframe = true;
@@ -350,6 +510,12 @@ export function createBroadcaster({
         fpsEntrada: framesEntrada,
         mbps: (bytes * 8) / 1e6,
         seconds: Math.floor((Date.now() - startedAt) / 1000),
+        // Quanto a rede pediu para ceder, e o que está no ar por causa disso.
+        // Ajuste automático invisível vira mistério: quem transmite precisa
+        // saber que a imagem piorou porque alguém não estava dando conta.
+        degraus,
+        bitrate: efetivo().bitrate,
+        fpsEfetivo: efetivo().fps,
       });
       bytes = 0;
       frames = 0;
@@ -562,6 +728,7 @@ export function createBroadcaster({
       }
     }
     audioEncoder = null;
+    audioConfig = null;
 
     somBloqueado = false;
     faixa.addEventListener('ended', () => onAviso?.('A fonte do som foi fechada.'));
@@ -591,15 +758,17 @@ export function createBroadcaster({
         // Som é acessório: se o encoder cair, a tela continua no ar.
         error: (err) => console.warn('[audio encoder]', err.message),
       });
-      audioEncoder.configure({
+      audioConfig = {
         codec: 'opus',
         sampleRate,
         numberOfChannels,
-        bitrate: AUDIO_BITRATE,
-      });
+        bitrate: bitrateAudioEfetivo(),
+      };
+      audioEncoder.configure(audioConfig);
     } catch (err) {
       console.warn('[audio encoder]', err.message);
       audioEncoder = null;
+      audioConfig = null;
       return;
     }
 
@@ -826,7 +995,7 @@ export function createBroadcaster({
     syncSize(frame);
 
     const now = Date.now();
-    if (now - lastKeyframeAt > KEYFRAME_EVERY_MS) wantKeyframe = true;
+    if (now - lastKeyframeAt > intervaloKeyframeAdaptativo(efetivo().bitrate)) wantKeyframe = true;
 
     let out = frame;
     if (stage) {
@@ -863,7 +1032,7 @@ export function createBroadcaster({
 
     srcW = sw;
     srcH = sh;
-    const target = fitWithin(sw, sh);
+    const target = alvoDeResolucao(sw, sh);
 
     if (target.width !== config.width || target.height !== config.height) {
       // O nível acompanha o tamanho. Uma janela de 720p que vira 1080p no meio
@@ -895,6 +1064,10 @@ export function createBroadcaster({
       });
     }
 
+    ajustarStage(sw, sh, target);
+  }
+
+  function ajustarStage(sw, sh, target) {
     // fitWithin preserva a proporção, então reduzir não corta nada.
     if (target.width === sw && target.height === sh) {
       stage = null;
@@ -912,7 +1085,8 @@ export function createBroadcaster({
 
     // O decoderConfig chega no primeiro chunk e sempre que a config muda.
     if (metadata?.decoderConfig) {
-      ws.send(JSON.stringify({ type: 'config', config: serializeConfig(metadata.decoderConfig) }));
+      videoConfig = serializeConfig(metadata.decoderConfig);
+      ws.send(JSON.stringify({ type: 'config', config: videoConfig }));
       configEnviada = true;
     }
 
@@ -963,20 +1137,32 @@ export function createBroadcaster({
 
   function connect() {
     return new Promise((resolve, reject) => {
-      ws = new WebSocket(wsUrl);
-      ws.binaryType = 'arraybuffer';
+      const socket = createTransport({ wsUrl, onTransport, onDiagnostic });
+      ws = socket;
+      socket.binaryType = 'arraybuffer';
+      let opened = false;
+      let settled = false;
+
+      const fail = (message) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeout);
+        reject(new Error(message));
+      };
 
       const timeout = setTimeout(() => {
-        ws.close();
-        reject(new Error('Não foi possível falar com o servidor (timeout).'));
+        socket.close();
+        fail('Não foi possível falar com o servidor (timeout).');
       }, 10_000);
 
-      ws.addEventListener('open', () => {
+      socket.addEventListener('open', () => {
+        opened = true;
+        settled = true;
         clearTimeout(timeout);
-        resolve();
+        resolve(socket);
       });
 
-      ws.addEventListener('message', (e) => {
+      socket.addEventListener('message', (e) => {
         if (typeof e.data !== 'string') return;
         const msg = JSON.parse(e.data);
 
@@ -990,6 +1176,15 @@ export function createBroadcaster({
         // Ninguém mais depende do relay para esta transmissão (ou voltou a
         // depender). Ver a nota em encodeFrame.
         else if (msg.type === 'chunks') enviarChunks = msg.on !== false;
+        // A rede de quem assiste pediu para ceder — ou devolveu o que emprestou.
+        else if (msg.type === 'quality-down') {
+          // O relay agrega a severidade da janela inteira. Mensagens antigas e
+          // valores malformados continuam valendo um degrau; valores válidos
+          // ficam limitados para que uma única amostra nunca derrube a escada.
+          const passos =
+            Number.isInteger(msg.steps) && msg.steps >= 1 ? Math.min(13, msg.steps) : 1;
+          ajustarDegraus(degraus + passos);
+        } else if (msg.type === 'quality-up') ajustarDegraus(degraus - 1);
         else if (msg.type === 'stop-request')
           stop(msg.motivo ?? 'Transmissão encerrada pela atividade.');
         else if (msg.type === 'error') {
@@ -1001,16 +1196,60 @@ export function createBroadcaster({
         }
       });
 
-      ws.addEventListener('error', () => {
-        clearTimeout(timeout);
-        reject(new Error('Falha ao conectar no servidor.'));
+      socket.addEventListener('error', () => {
+        if (!opened) fail('Falha ao conectar no servidor.');
       });
 
-      ws.addEventListener('close', () => {
+      socket.addEventListener('close', () => {
         clearTimeout(timeout);
-        if (running) stop('Conexão com o servidor caiu.');
+        if (ws === socket) ws = null;
+        if (!opened) fail('Falha ao conectar no servidor.');
+        if (running) agendarReconexao();
       });
     });
+  }
+
+  /** Reatacha a captura existente a uma nova sessão lógica. */
+  function agendarReconexao() {
+    if (!running || reconnectTimer || reconnecting) return;
+    reconnectTimer = setTimeout(async () => {
+      reconnectTimer = null;
+      if (!running) return;
+      reconnecting = true;
+      try {
+        const socket = await connect();
+        if (!running) {
+          socket.close();
+          return;
+        }
+
+        // O servidor preserva a entry e os watches durante a carência. Configs
+        // vêm antes do keyframe para recriar qualquer decoder que viu o gap.
+        socket.send(JSON.stringify({ type: 'resume' }));
+        if (videoConfig) socket.send(JSON.stringify({ type: 'config', config: videoConfig }));
+        if (audioConfig) {
+          socket.send(
+            JSON.stringify({
+              type: 'audio-config',
+              config: {
+                codec: 'opus',
+                sampleRate: audioConfig.sampleRate,
+                numberOfChannels: audioConfig.numberOfChannels,
+              },
+            }),
+          );
+        }
+        reconnectDelay = RECONNECT_INITIAL_MS;
+        wantKeyframe = true;
+        lastKeyframeAt = 0;
+        relatarQualidade();
+      } catch {
+        reconnectDelay = Math.min(RECONNECT_MAX_MS, reconnectDelay * 2);
+      } finally {
+        reconnecting = false;
+        if (running && ws?.readyState !== WebSocket.OPEN) agendarReconexao();
+      }
+    }, reconnectDelay);
   }
 
   // -------------------------------------------------------------------- parar
@@ -1041,12 +1280,14 @@ export function createBroadcaster({
 
       const pc = criarPeer({
         ice,
+        iceTransportPolicy: politicaIceDaUrl(),
         onIce: (candidate) => enviarRtc(peerId, { kind: 'ice', candidate }),
         onEstado: (estado) => {
           if (MORTO.has(estado)) fecharPeer(peerId);
         },
       });
       peers.set(peerId, pc);
+      icePendentes.set(peerId, []);
 
       for (const track of stream.getTracks()) pc.addTrack(track, stream);
 
@@ -1070,12 +1311,28 @@ export function createBroadcaster({
     try {
       if (payload.kind === 'answer' && payload.sdp) {
         await pc.setRemoteDescription(payload.sdp);
+        if (peers.get(peerId) !== pc) return;
+        remotaPronta.add(pc);
+        const pendentes = icePendentes.get(peerId)?.splice(0) ?? [];
+        for (const candidate of pendentes) {
+          try {
+            await pc.addIceCandidate(candidate);
+          } catch (err) {
+            console.warn('[rtc]', err.message);
+          }
+        }
       } else if (payload.kind === 'ice' && payload.candidate) {
+        if (!remotaPronta.has(pc)) {
+          const pendentes = icePendentes.get(peerId) ?? [];
+          pendentes.push(payload.candidate);
+          icePendentes.set(peerId, pendentes);
+          return;
+        }
         await pc.addIceCandidate(payload.candidate);
       }
     } catch (err) {
-      // Candidato que chega antes da descrição remota é normal e recuperável;
-      // derrubar a conexão por causa dele custaria uma renegociação inteira.
+      // Candidato inválido não deve derrubar uma negociação que ainda pode usar
+      // os demais; os fora de ordem são preservados acima até a descrição remota.
       console.warn('[rtc]', err.message);
     }
   }
@@ -1084,6 +1341,7 @@ export function createBroadcaster({
     const pc = peers.get(peerId);
     if (!pc) return;
     peers.delete(peerId);
+    icePendentes.delete(peerId);
     try {
       pc.close();
     } catch {
@@ -1170,8 +1428,49 @@ export function createBroadcaster({
     return fresh;
   }
 
-  /** Ajusta qualidade e taxa de quadros com a transmissão no ar. */
-  function setQuality({ bitrate: nextBitrate, fps: nextFps } = {}) {
+  /**
+   * Muda o TETO — o que a pessoa escolheu na engrenagem.
+   *
+   * A redução automática que estiver valendo é preservada e recalculada sobre o
+   * teto novo: quem baixou a qualidade no meio de um congestionamento não deve
+   * ver a rede voltar a apertar no instante seguinte, e quem subiu não deve
+   * receber mais do que a rede aguenta. O snapshot sai depois, porque `piso`
+   * acabou de mudar de sentido — no teto antigo a escada podia estar esgotada e
+   * no novo não está.
+   */
+  function setQuality({ bitrate: nextBitrate, fps: nextFps, resolution: nextResolution } = {}) {
+    teto = {
+      bitrate: nextBitrate || teto.bitrate,
+      fps: nextFps || teto.fps,
+      resolution:
+        nextResolution === undefined ? teto.resolution : normalizarResolucao(nextResolution),
+    };
+    aplicarQualidade();
+    relatarQualidade();
+  }
+
+  /** Aplica N reduções automáticas abaixo do teto e reporta o resultado. */
+  function ajustarDegraus(alvo) {
+    const limite = degrausAteSaturar(teto);
+    const proximo = Math.max(0, Math.min(limite, alvo));
+    if (proximo === degraus) {
+      // Nada mudou de fato — mas o servidor precisa saber que estamos no piso,
+      // senão insiste em pedir o que não há como ceder.
+      relatarQualidade();
+      return;
+    }
+    degraus = proximo;
+    aplicarQualidade();
+    relatarQualidade();
+  }
+
+  /** Leva a qualidade efetiva ao encoder, à captura e às conexões diretas. */
+  function aplicarQualidade() {
+    const atual = efetivo();
+    const nextBitrate = atual.bitrate;
+    const nextFps = atual.fps;
+    const nextAudioBitrate = bitrateAudioEfetivo();
+
     if (nextBitrate) bitrate = nextBitrate;
     // Taxa nova, grade nova: o freio do encodeFrame mede contra a taxa atual, e
     // subir de 15 para 60 fps precisa valer já no próximo quadro.
@@ -1180,11 +1479,38 @@ export function createBroadcaster({
       proximaMarca = null;
       afogado = false;
     }
+    if (
+      audioEncoder?.state === 'configured' &&
+      audioConfig &&
+      audioConfig.bitrate !== nextAudioBitrate
+    ) {
+      audioConfig = { ...audioConfig, bitrate: nextAudioBitrate };
+      audioEncoder.configure(audioConfig);
+    }
     if (encoder?.state !== 'configured') return;
 
-    config = { ...config, bitrate, framerate: fps };
+    const sw = srcW || config.width;
+    const sh = srcH || config.height;
+    const target = alvoDeResolucao(sw, sh);
+    const mudouTamanho = target.width !== config.width || target.height !== config.height;
+    config = {
+      ...config,
+      ...target,
+      codec: comNivel(config.codec, nivelH264(target.width, target.height, fps)),
+      bitrate,
+      framerate: fps,
+    };
     encoder.configure(config);
     wantKeyframe = true;
+    ajustarStage(sw, sh, target);
+    if (mudouTamanho) {
+      onStatus?.({
+        codec: config.codec,
+        width: config.width,
+        height: config.height,
+        direct: Boolean(window.MediaStreamTrackProcessor),
+      });
+    }
 
     // Pedir a taxa nova à própria captura evita gastar CPU codificando quadros
     // que seriam descartados adiante.
@@ -1217,6 +1543,10 @@ export function createBroadcaster({
 
     clearInterval(statsTimer);
     statsTimer = null;
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+    reconnecting = false;
+    reconnectDelay = RECONNECT_INITIAL_MS;
 
     reader?.cancel().catch(() => {});
     reader = null;
@@ -1234,6 +1564,8 @@ export function createBroadcaster({
     }
     encoder = null;
     audioEncoder = null;
+    audioConfig = null;
+    videoConfig = null;
 
     if (ws?.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify({ type: 'stop' }));

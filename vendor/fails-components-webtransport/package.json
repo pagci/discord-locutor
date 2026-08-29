@@ -1,0 +1,59 @@
+{
+  "name": "@fails-components/webtransport",
+  "version": "1.6.7",
+  "description": "A component to add webtransport support (server and client) to node.js using libquiche",
+  "exports": {
+    ".": {
+      "node": {
+        "types": "./dist/lib/index.node.d.ts",
+        "import": "./lib/index.node.js"
+      },
+      "browser": {
+        "types": "./dist/lib/index.browser.d.ts",
+        "import": "./lib/index.browser.js"
+      }
+    }
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "type": "module",
+  "types": "./dist/lib/index.types.d.ts",
+  "files": [
+    "lib",
+    "dist",
+    "LICENSE",
+    "README.discord-locutor.md",
+    "readme.md"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/fails-components/webtransport.git"
+  },
+  "keywords": [
+    "webtransport"
+  ],
+  "author": "Marten Richter",
+  "license": "BSD-3-Clause",
+  "discordLocutorFork": {
+    "upstream": "@fails-components/webtransport@1.6.7",
+    "scope": "Idempotent native onClose cleanup plus observable per-writer datagram backpressure"
+  },
+  "bugs": {
+    "url": "https://github.com/fails-components/webtransport/issues"
+  },
+  "homepage": "https://github.com/fails-components/webtransport/tree/master/main#readme",
+  "dependencies": {
+    "@types/debug": "^4.1.7",
+    "bindings": "^1.5.0",
+    "debug": "^4.3.4"
+  },
+  "binary": {
+    "napi_versions": [
+      6
+    ]
+  },
+  "browser": {
+    "./lib/webstreams.js": "./lib/webstreams.browser.js"
+  }
+}

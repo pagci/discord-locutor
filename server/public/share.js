@@ -18,7 +18,9 @@ import {
   supportError,
   fonteIndisponivel,
   opcoesTela,
-} from '/shared/broadcaster.js?v=8';
+} from '/shared/broadcaster.js?v=9';
+import { createTransport } from '/shared/transport.js';
+import { normalizeStreamSettings } from '/shared/stream-quality.js?v=1';
 
 const $ = (id) => document.getElementById(id);
 
@@ -50,11 +52,12 @@ function guardadas() {
 }
 
 const salvas = guardadas();
-const opcoes = {
+const opcoes = normalizeStreamSettings({
   // A URL vence o que está guardado: ela carrega a intenção desta abertura.
   bitrate: Number(query.get('q')) || Number(salvas.bitrate) || 2_500_000,
+  resolution: Number(query.get('res')) || Number(salvas.resolution) || 1080,
   fps: Number(query.get('fps')) || Number(salvas.fps) || 30,
-};
+});
 
 function guardar() {
   try {
@@ -66,12 +69,14 @@ function guardar() {
 
 function espelharOpcoes() {
   $('qualidade').value = String(opcoes.bitrate);
+  $('resolucao').value = String(opcoes.resolution);
   $('quadros').value = String(opcoes.fps);
 }
 
 function aplicarOpcoes(novas) {
   if (!novas) return;
   if (Number(novas.q)) opcoes.bitrate = Number(novas.q);
+  if (Number(novas.res)) opcoes.resolution = Number(novas.res);
   if (Number(novas.fps)) opcoes.fps = Number(novas.fps);
   // Os selects seguem o valor efetivo: mostrar 5 Mbps enquanto se transmite a
   // 1 Mbps é pior do que não mostrar nada.
@@ -100,6 +105,33 @@ function readTokenPayload() {
   } catch {
     return null;
   }
+}
+
+/**
+ * Conta que a rede de quem assiste fez a qualidade cair — e o que sobrou.
+ *
+ * Fica num elemento próprio e PERSISTENTE, não num aviso que some: a redução
+ * dura enquanto a rede estiver apertada, e um aviso passageiro deixaria a
+ * pessoa vendo a imagem pior sem explicação nenhuma pelo resto da transmissão.
+ * Ajuste automático invisível vira mistério — e o mistério vira reclamação de
+ * que "o programa piorou sozinho".
+ */
+export function mostrarQualidadeAutomatica(elemento, { degraus, bitrate, fps, fpsEfetivo } = {}) {
+  if (!elemento) return null;
+
+  if (!degraus) {
+    elemento.hidden = true;
+    elemento.textContent = '';
+    return elemento;
+  }
+
+  const mbps = Number(bitrate ?? 0) / 1e6;
+  const taxa = fpsEfetivo ?? fps;
+  elemento.hidden = false;
+  elemento.textContent =
+    `Qualidade reduzida automaticamente: ${mbps.toFixed(1)} Mb/s · ${taxa} fps` +
+    ' — a rede de quem está assistindo não estava dando conta.';
+  return elemento;
 }
 
 function falhar(titulo, msg) {
@@ -195,12 +227,21 @@ function atenderPedido(fonte, novas) {
  */
 let controle = null;
 let religar = null;
+let transporteControle = null;
+let fallbackControle = null;
 
 function ligarControle() {
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-  controle = new WebSocket(
-    `${proto}://${location.host}/ws?t=${encodeURIComponent(token)}&modo=controle`,
-  );
+  controle = createTransport({
+    wsUrl: `${proto}://${location.host}/ws?t=${encodeURIComponent(token)}&modo=controle`,
+    onTransport: ({ transport, fallbackReason }) => {
+      transporteControle = transport;
+      fallbackControle = fallbackReason ?? null;
+      document.documentElement.dataset.controlTransport = transporteControle;
+      if (fallbackControle) document.documentElement.dataset.controlFallback = fallbackControle;
+      else delete document.documentElement.dataset.controlFallback;
+    },
+  });
 
   controle.addEventListener('message', (e) => {
     if (typeof e.data !== 'string') return;
@@ -241,6 +282,9 @@ function criarPainel(fonte) {
   const camera = fonte === 'camera';
 
   let broadcaster = null;
+  let statusTecnico = null;
+  let transporteAtivo = null;
+  let fallbackAtivo = null;
 
   /**
    * Prévia local: o que a fonte mostra, antes de qualquer transmissão.
@@ -288,6 +332,15 @@ function criarPainel(fonte) {
     const alvo = el('status');
     alvo.textContent = msg;
     alvo.className = `status ${kind}`;
+  }
+
+  function mostrarStatusTecnico() {
+    if (!statusTecnico) return;
+    const transporte = transporteAtivo === 'webtransport' ? 'WebTransport' : 'WebSocket';
+    const fallback = fallbackAtivo ? ` · fallback WT: ${fallbackAtivo}` : '';
+    setStatus(
+      `Codec: ${statusTecnico.codec} · ${statusTecnico.width}×${statusTecnico.height} · captura ${statusTecnico.direct ? 'direta' : 'via <video>'} · transporte ${transporte}${fallback}`,
+    );
   }
 
   function mostrarSetup() {
@@ -418,6 +471,7 @@ function criarPainel(fonte) {
       wsUrl: `${proto}://${location.host}/ws?t=${encodeURIComponent(token)}&fonte=${fonte}`,
       bitrate: opcoes.bitrate,
       fps: opcoes.fps,
+      resolution: opcoes.resolution,
       audio: !camera,
       fonte,
       // A prévia já pagou o gesto do usuário e a permissão: reaproveitá-la é o
@@ -425,16 +479,22 @@ function criarPainel(fonte) {
       // compartilhamento.
       streamPronto: previa,
       deviceId: camera ? dispositivo : null,
-      onStatus: (s) =>
-        setStatus(
-          `Codec: ${s.codec} · ${s.width}×${s.height} · captura ${s.direct ? 'direta' : 'via <video>'}`,
-        ),
+      onStatus: (s) => {
+        statusTecnico = s;
+        mostrarStatusTecnico();
+      },
+      onTransport: ({ transport, fallbackReason }) => {
+        transporteAtivo = transport;
+        fallbackAtivo = fallbackReason ?? null;
+        mostrarStatusTecnico();
+      },
       onStats: (s) => {
         el('viewers').textContent = s.viewers;
         el('fps').textContent = `${s.fps} fps`;
         el('bitrate').textContent = `${s.mbps.toFixed(1)} Mb/s`;
         el('elapsed').textContent =
           `${String(Math.floor(s.seconds / 60)).padStart(2, '0')}:${String(s.seconds % 60).padStart(2, '0')}`;
+        mostrarQualidadeAutomatica(el('auto'), s);
       },
       onAviso: (msg) => setStatus(msg, 'aviso'),
       onEnd: (reason) => {
@@ -509,7 +569,12 @@ function criarPainel(fonte) {
     verCamera,
     setStatus,
     indisponivel: () => Boolean(indisponivel),
-    aplicarQualidade: () => broadcaster?.setQuality({ bitrate: opcoes.bitrate, fps: opcoes.fps }),
+    aplicarQualidade: () =>
+      broadcaster?.setQuality({
+        bitrate: opcoes.bitrate,
+        fps: opcoes.fps,
+        resolution: opcoes.resolution,
+      }),
     ativo: () => Boolean(broadcaster),
     // Fechar a aba tem que soltar a câmera, esteja ela no ar ou só na prévia.
     parar: () => {
@@ -561,6 +626,7 @@ $('somAba').addEventListener('click', async () => {
 
 espelharOpcoes();
 $('qualidade').addEventListener('change', (e) => mudarOpcao('bitrate', e.target.value));
+$('resolucao').addEventListener('change', (e) => mudarOpcao('resolution', e.target.value));
 $('quadros').addEventListener('change', (e) => mudarOpcao('fps', e.target.value));
 
 window.addEventListener('beforeunload', () => {

@@ -42,6 +42,30 @@ WebCodecs elimina os dois. Cada quadro é codificado, enviado e desenhado
 individualmente, sem container. E, ao contrário de `display-capture`, WebCodecs
 não é bloqueado dentro do iframe.
 
+## Relay oportunista: WebTransport com WebSocket universal
+
+Viewer, aba de captura e transmissor não escolhem o transporte por conta própria.
+Todos pedem um socket lógico à mesma factory. Para cada conexão ela consulta a
+capability do nó dono da sala sem enviar o token, tenta WebTransport por até
+1,5 segundo quando um listener HTTP/3 realmente está pronto e, antes de `OPEN`,
+cai uma única vez para o WebSocket original. Capability ausente, addon opcional
+ausente ou listener perdido nunca desliga o WS.
+
+No WebTransport, JSON de controle usa um stream bidirecional enquadrado. Keyframes
+usam streams unidirecionais confiáveis; deltas e áudio usam datagramas fragmentados,
+com FEC XOR temporária quando a telemetria nativa confirma perda. A barreira de
+controle por destinatário impede um chunk de ultrapassar seu `config`, enquanto
+lanes separadas por slot e classe evitam que um áudio lento bloqueie outra tela.
+Filas, assemblies e bytes retidos têm tetos e deadlines. Se um delta some, a lane
+espera só 250 ms: reaproveita um keyframe confiável que já tenha chegado ou pede
+outro ao transmissor, repetindo o pedido com cadência limitada até recuperar.
+
+Isso troca apenas o relay. A tentativa WebRTC direta descrita abaixo continua
+igual: quando o primeiro quadro aparece no `<video>`, aquele viewer sai do relay,
+seja ele WT ou WS. O painel de diagnóstico mostra o transporte que de fato venceu
+o handshake e um motivo sanitizado quando uma tentativa WT caiu para WS; nunca
+deduz “QUIC ativo” apenas porque a API existe no navegador.
+
 ## Keyframe sob demanda
 
 Quem chega no meio de uma transmissão não consegue decodificar nada até receber
@@ -122,11 +146,70 @@ buffer sem tocar nele, e quem assiste sabe para qual decodificador mandar. Até
 O relógio de envio serve só para medir atraso. É exato na mesma máquina; entre
 máquinas diferentes, aproximado.
 
-Controle vai em JSON: `start`, `config`, `audio-config`, `stop`, `rtc`
-(transmissor → servidor); `state`, `stream-start`, `config`, `audio-config`,
-`stream-stop`, `need-keyframe`, `rtc-want`, `rtc`, `rtc-bye`, `chunks`,
-`error` (servidor → clientes); `watch`, `unwatch`, `rtc`, `rtc-ativo`
-(espectador → servidor).
+Controle vai em JSON: `start`, `config`, `audio-config`, `stop`, `rtc`,
+`quality` (transmissor → servidor); `state`, `stream-start`, `config`,
+`audio-config`, `stream-stop`, `need-keyframe`, `rtc-want`, `rtc`, `rtc-bye`,
+`chunks`, `quality-down`, `quality-up`, `error` (servidor → clientes);
+`watch`, `unwatch`, `rtc`, `rtc-ativo` (espectador → servidor).
+
+## Qualidade adaptativa
+
+O servidor é o único lado que enxerga todos os espectadores ao mesmo tempo.
+Quem transmite não sabe que a conexão de alguém está engasgando; quem assiste
+não sabe se o problema é só dele. O relay sabe as duas coisas, e é por isso que
+ele decide **quando** a qualidade precisa ceder — enquanto o transmissor, dono
+do codificador, decide **quanto**.
+
+A cada 4 segundos, junto da limpeza de salas, o servidor classifica cada
+transmissão em uma de três situações:
+
+- **suja** — algum espectador que depende do relay derrubou 2 ou mais quadros
+  na janela. Sai um `quality-down`, no máximo um a cada 2 s;
+- **limpa** — existe espectador pelo relay e nenhum deles sofreu. Duas janelas
+  limpas **consecutivas**, mais 10 s desde o último ajuste, devolvem um degrau
+  com `quality-up`;
+- **sem evidência** — não há espectador nenhum pelo relay (todos migraram para
+  a conexão direta, ou ninguém está assistindo). Isso não é prova de saúde, é
+  ausência de prova: a sequência de janelas limpas **zera**, e nada é ajustado.
+
+A assimetria é deliberada: descer custa uma janela, subir custa duas janelas
+limpas seguidas e dez segundos. É essa histerese que impede o laço de oscilar
+com um espectador instável — entre um `quality-down` e o `quality-up` seguinte
+passam no mínimo três janelas.
+
+O transmissor aplica o degrau sobre a **escolha da pessoa**, nunca sobre o
+valor anterior: primeiro o bitrate cai 25% por degrau até o piso de 300 kbps, e
+só então a taxa de quadros desce (60 → 30 → 24 → 18 → 15). A qualidade efetiva
+é sempre derivada do par (teto escolhido, degraus), então o ajuste automático
+não tem como ultrapassar o que a pessoa pediu — não existe caminho de código
+que suba acima do teto.
+
+Depois de cada mudança — automática ou manual — o transmissor responde com um
+snapshot:
+
+```json
+{ "type": "quality", "degraus": 3, "bitrate": 1054688, "fps": 30, "piso": false }
+```
+
+O servidor **espelha** esse relato em vez de manter contagem própria. Se ele
+contasse sozinho, teria a mesma escada escrita em dois lugares, livres para
+divergir — e a divergência apareceria como dívida de `quality-up` que nunca
+fecha, ou como `quality-down` insistindo com quem já está no piso. Com o
+snapshot, `piso: true` faz o servidor parar de pedir o que não há como ceder, e
+a recuperação é finita por construção. Um transmissor que nunca reporta
+simplesmente nunca recebe `quality-up`: falha fechando, nunca acima do teto.
+
+O primeiro snapshot sai logo depois do `start` e **antes do primeiro quadro**.
+A ordem importa: sem ele o relay ainda não conhece a taxa da transmissão, trata
+a janela fria pelo orçamento mínimo em bytes e recusaria o primeiro keyframe de
+uma tela grande — que passa de centenas de KB.
+
+**Limitação assumida, a mesma do Discord:** o codificador é um só, então
+socorrer um espectador reduz a qualidade para todos. A saída estrutural — uma
+qualidade por espectador — exige codificar N vezes, que é o que um SFU de
+verdade faz e está fora do escopo deste projeto. Quem tem conexão boa e não
+quer pagar pelo vizinho já tem a saída que existe: a conexão direta por WebRTC,
+que tira aquele espectador do relay e do cálculo.
 
 ## WebRTC por cima do relay
 

@@ -1,6 +1,15 @@
 import { defineConfig } from 'vitest/config';
+import { fileURLToPath } from 'node:url';
+
+const raiz = fileURLToPath(new URL('.', import.meta.url));
 
 export default defineConfig({
+  resolve: {
+    alias: {
+      '/share.js': `${raiz}server/public/share.js`,
+      '/shared/': `${raiz}shared/`,
+    },
+  },
   test: {
     // O padrão é Node, que é onde mora quase tudo o que se mede aqui. Os
     // testes de `shared/` pedem o navegador com um `@vitest-environment

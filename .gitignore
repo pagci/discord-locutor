@@ -6,6 +6,10 @@ dist/
 .cache/
 site/
 coverage/
+__pycache__/
+.ensaio-delay/
+ensaio-resultados/
+.claydis/
 
 # O zip de deploy, montado a partir da propria pasta. Nao e fonte de nada.
 *.zip

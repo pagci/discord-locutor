@@ -10,7 +10,15 @@
  * uma faixa de som que traria o Discord de volta em eco, e o que sai no fio.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { createBroadcaster, fonteIndisponivel, nivelH264, supportError } from './broadcaster.js';
+import {
+  createBroadcaster,
+  escalaResolucaoAdaptativa,
+  fonteIndisponivel,
+  intervaloKeyframeAdaptativo,
+  nivelH264,
+  qualidadeComDegraus,
+  supportError,
+} from './broadcaster.js';
 
 // ------------------------------------------------------------------- dublês
 
@@ -184,6 +192,7 @@ class AudioEncoderFalso {
   configure(config) {
     this.state = 'configured';
     this.config = config;
+    (this.configuracoes ??= []).push(config);
   }
   encode(dados) {
     this.codificados.push(dados);
@@ -414,6 +423,39 @@ afterEach(() => {
 });
 
 // ------------------------------------------------------------------- testes
+
+describe('escalaResolucaoAdaptativa', () => {
+  it('reduz pixels em degraus junto com a banda sem ultrapassar o teto manual', () => {
+    expect(escalaResolucaoAdaptativa(2_500_000, 2_500_000)).toBe(1);
+    expect(escalaResolucaoAdaptativa(2_500_000, 1_400_000)).toBe(0.67);
+    expect(escalaResolucaoAdaptativa(2_500_000, 600_000)).toBe(0.5);
+    expect(escalaResolucaoAdaptativa(2_500_000, 300_000)).toBe(0.35);
+    expect(escalaResolucaoAdaptativa(2_500_000, 60_000)).toBe(0.15);
+  });
+});
+
+describe('intervaloKeyframeAdaptativo', () => {
+  it('preserva capacidade no piso porque a ressincronização urgente vem do feedback', () => {
+    expect(intervaloKeyframeAdaptativo(2_500_000)).toBe(3000);
+    expect(intervaloKeyframeAdaptativo(121_000)).toBe(3000);
+    expect(intervaloKeyframeAdaptativo(120_000)).toBe(5000);
+    expect(intervaloKeyframeAdaptativo(60_001)).toBe(5000);
+    expect(intervaloKeyframeAdaptativo(60_000)).toBe(5000);
+  });
+});
+
+describe('qualidadeComDegraus', () => {
+  it('tem piso de emergência que cabe em relay de 600 kb/s atravessado duas vezes', () => {
+    expect(qualidadeComDegraus({ bitrate: 2_500_000, fps: 30 }, 13)).toEqual({
+      bitrate: 60_000,
+      fps: 30,
+    });
+    expect(qualidadeComDegraus({ bitrate: 2_500_000, fps: 30 }, 16)).toEqual({
+      bitrate: 60_000,
+      fps: 15,
+    });
+  });
+});
 
 describe('nivelH264', () => {
   /**
@@ -700,13 +742,27 @@ describe('conexão', () => {
     expect(onEnd).toHaveBeenCalledWith('Transmissão encerrada pela atividade.');
   });
 
-  it('encerra quando a conexão cai sozinha', async () => {
+  it('reconecta sem encerrar captura quando a conexão cai sozinha', async () => {
     const onEnd = vi.fn();
-    const { ws } = await noAr({ onEnd });
+    const { b, ws } = await noAr({ onEnd });
 
+    ws.readyState = 3;
     ws.disparar('close');
+    await new Promise((resolve) => setTimeout(resolve, 120));
 
-    expect(onEnd).toHaveBeenCalledWith('Conexão com o servidor caiu.');
+    expect(sockets).toHaveLength(2);
+    const retomado = sockets.at(-1);
+    retomado.abrir();
+    await respirar();
+
+    expect(b.isRunning()).toBe(true);
+    expect(onEnd).not.toHaveBeenCalled();
+    expect(retomado.mensagens()).toEqual(
+      expect.arrayContaining([
+        { type: 'resume' },
+        expect.objectContaining({ type: 'quality', degraus: 0 }),
+      ]),
+    );
   });
 
   it('ignora o que chega no socket e não é texto', async () => {
@@ -1053,6 +1109,9 @@ describe('conexão direta', () => {
     ws.receber({ type: 'rtc-want', peer: 'p1' });
     await respirar(8);
 
+    ws.receber({ type: 'rtc', peer: 'p1', payload: { kind: 'answer', sdp: { type: 'answer' } } });
+    await respirar(4);
+
     ws.receber({
       type: 'rtc',
       peer: 'p1',
@@ -1061,6 +1120,42 @@ describe('conexão direta', () => {
     await respirar(4);
 
     expect(peers[0].candidatos).toEqual([{ candidate: 'c' }]);
+  });
+
+  it('preserva candidato que chega enquanto a resposta remota ainda está sendo aplicada', async () => {
+    const { ws } = await noAr();
+    ws.receber({ type: 'rtc-want', peer: 'p1' });
+    await respirar(8);
+
+    let liberarResposta;
+    peers[0].setRemoteDescription = vi.fn(
+      (sdp) =>
+        new Promise((resolve) => {
+          liberarResposta = () => {
+            peers[0].remotas.push(sdp);
+            resolve();
+          };
+        }),
+    );
+    peers[0].addIceCandidate = vi.fn(async (candidate) => {
+      if (!peers[0].remotas.length) throw new Error('InvalidStateError');
+      peers[0].candidatos.push(candidate);
+    });
+
+    ws.receber({ type: 'rtc', peer: 'p1', payload: { kind: 'answer', sdp: { type: 'answer' } } });
+    await respirar();
+    ws.receber({
+      type: 'rtc',
+      peer: 'p1',
+      payload: { kind: 'ice', candidate: { candidate: 'relay-udp' } },
+    });
+    await respirar();
+
+    expect(peers[0].candidatos).toEqual([]);
+    liberarResposta();
+    await respirar(4);
+
+    expect(peers[0].candidatos).toEqual([{ candidate: 'relay-udp' }]);
   });
 
   it('ignora sinalização endereçada a um peer que não existe', async () => {
@@ -1240,6 +1335,19 @@ describe('som', () => {
     expect(new DataView(ws.binarios().at(-1)).getUint8(1)).toBe(3);
   });
 
+  it('reserva banda de áudio no piso emergencial e a devolve na recuperação', async () => {
+    const { ws } = await noAr({ audio: true }, comSom('browser'));
+    await respirar();
+
+    expect(audioEncoders.at(-1).configuracoes.at(-1).bitrate).toBe(96_000);
+
+    ws.receber({ type: 'quality-down', steps: 13 });
+    expect(audioEncoders.at(-1).configuracoes.at(-1).bitrate).toBe(32_000);
+
+    for (let i = 0; i < 13; i++) ws.receber({ type: 'quality-up' });
+    expect(audioEncoders.at(-1).configuracoes.at(-1).bitrate).toBe(96_000);
+  });
+
   it('sem AudioEncoder no navegador, a tela continua no ar sem som', async () => {
     montarNavegador({ sem: ['AudioEncoder'] });
 
@@ -1383,6 +1491,14 @@ describe('setQuality', () => {
     b.setQuality({});
 
     expect(b.getSettings()).toEqual({ bitrate: 2_500_000, fps: 30 });
+  });
+
+  it('aplica o teto de resolução escolhido sem cortar a fonte', async () => {
+    const { b, encoder } = await noAr();
+
+    b.setQuality({ resolution: 480 });
+
+    expect(encoder.configuracoes.at(-1)).toMatchObject({ width: 852, height: 480 });
   });
 });
 

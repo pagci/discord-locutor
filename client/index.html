@@ -11,6 +11,10 @@
       <div class="topbar">
         <div id="people" class="pill" title="Pessoas na sala"></div>
         <div id="roomPill" class="pill room-pill" hidden></div>
+        <!-- Fora do #people de propósito: renderBar() reconstrói aquele a cada
+             atualização de sala, e um aviso que some a cada mudança de estado é
+             um toast disfarçado. A redução dura enquanto a rede estiver ruim. -->
+        <div id="qualidadeAuto" class="pill" data-quality-auto hidden></div>
       </div>
 
       <main id="grid" class="grid"></main>
@@ -36,6 +40,71 @@
         </header>
 
         <div id="roomList" class="room-list"></div>
+      </div>
+
+      <div id="streamQualityModal" class="modal" hidden>
+        <div
+          class="modal-card quality-modal-card"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="streamQualityTitle"
+        >
+          <h2 id="streamQualityTitle">Qualidade da transmissão</h2>
+          <p class="modal-sub">
+            Escolha o teto da imagem. A rede ainda pode reduzir a qualidade temporariamente para
+            evitar travamentos.
+          </p>
+
+          <fieldset class="quality-choice">
+            <legend>Resolução</legend>
+            <div class="quality-grid">
+              <label class="quality-option"
+                ><input type="radio" name="streamResolution" value="480" /><span
+                  ><strong>480p</strong><small>Leve</small></span
+                ></label
+              >
+              <label class="quality-option"
+                ><input type="radio" name="streamResolution" value="720" /><span
+                  ><strong>720p</strong><small>Equilibrado</small></span
+                ></label
+              >
+              <label class="quality-option"
+                ><input type="radio" name="streamResolution" value="1080" /><span
+                  ><strong>1080p</strong><small>Mais nítido</small></span
+                ></label
+              >
+            </div>
+          </fieldset>
+
+          <fieldset class="quality-choice field-gap">
+            <legend>Taxa de quadros</legend>
+            <div class="quality-grid">
+              <label class="quality-option"
+                ><input type="radio" name="streamFps" value="15" /><span
+                  ><strong>15 FPS</strong><small>Economia</small></span
+                ></label
+              >
+              <label class="quality-option"
+                ><input type="radio" name="streamFps" value="30" /><span
+                  ><strong>30 FPS</strong><small>Recomendado</small></span
+                ></label
+              >
+              <label class="quality-option"
+                ><input type="radio" name="streamFps" value="60" /><span
+                  ><strong>60 FPS</strong><small>Movimento</small></span
+                ></label
+              >
+            </div>
+          </fieldset>
+
+          <p class="modal-note">
+            A preferência fica salva neste navegador e também é enviada à página externa de captura.
+          </p>
+          <div class="modal-actions">
+            <button id="streamQualityCancel" class="btn">Cancelar</button>
+            <button id="streamQualitySave" class="btn go">Salvar</button>
+          </div>
+        </div>
       </div>
 
       <div id="createModal" class="modal" hidden>
@@ -101,20 +170,50 @@
         <div id="panel" class="panel" hidden>
           <div class="panel-row"><span>Transmitindo</span><strong id="pWho">—</strong></div>
           <div class="panel-row"><span>Transporte</span><strong id="pVia">—</strong></div>
-          <div class="panel-row"><span>Latência</span><strong id="pLag">—</strong></div>
+          <div class="panel-row"><span id="pLagLabel">Rede</span><strong id="pLag">—</strong></div>
           <div class="panel-row"><span>Irregularidade</span><strong id="pJitter">—</strong></div>
           <div class="panel-row"><span>Quadros</span><strong id="pFps">—</strong></div>
+          <div class="panel-row"><span>Recebido</span><strong id="pBitrate">—</strong></div>
+          <div class="panel-row"><span>Quality gate</span><strong id="pQualityGate">—</strong></div>
           <div class="panel-row"><span>Resolução</span><strong id="pRes">—</strong></div>
           <div class="panel-row"><span>Som</span><strong id="pSom">—</strong></div>
           <button id="probe" class="panel-btn">Testar captura no iframe</button>
         </div>
 
+        <div id="viaBadge" class="via-badge" role="status" aria-live="polite" hidden></div>
+        <div
+          id="qualityBadge"
+          class="via-badge quality-badge"
+          role="status"
+          aria-live="polite"
+          hidden
+        ></div>
+
         <div class="dock">
           <div class="group">
-            <button id="share" class="btn" data-tip="Compartilhar tela" aria-label="Compartilhar tela">
+            <button
+              id="share"
+              class="btn"
+              data-tip="Compartilhar tela"
+              aria-label="Compartilhar tela"
+            >
               <svg viewBox="0 0 24 24" aria-hidden="true">
                 <path d="M3 5h18v11H3z" />
                 <path d="M8 20h8" />
+              </svg>
+            </button>
+            <button
+              id="shareSettings"
+              class="btn"
+              data-tip="Qualidade da transmissão"
+              aria-label="Qualidade da transmissão"
+              hidden
+            >
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <circle cx="12" cy="12" r="3" />
+                <path
+                  d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1-2.8 2.8-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.6v.2h-4V21a1.7 1.7 0 0 0-1-1.6 1.7 1.7 0 0 0-1.9.3l-.1.1L4.2 17l.1-.1a1.7 1.7 0 0 0 .3-1.9A1.7 1.7 0 0 0 3 14H2.8v-4H3a1.7 1.7 0 0 0 1.6-1 1.7 1.7 0 0 0-.3-1.9L4.2 7 7 4.2l.1.1A1.7 1.7 0 0 0 9 4.6 1.7 1.7 0 0 0 10 3v-.2h4V3a1.7 1.7 0 0 0 1 1.6 1.7 1.7 0 0 0 1.9-.3l.1-.1L19.8 7l-.1.1a1.7 1.7 0 0 0-.3 1.9 1.7 1.7 0 0 0 1.6 1h.2v4H21a1.7 1.7 0 0 0-1.6 1z"
+                />
               </svg>
             </button>
             <button id="camera" class="btn" data-tip="Ligar câmera" aria-label="Ligar câmera">
@@ -160,10 +259,18 @@
             >
               <svg viewBox="0 0 24 24" aria-hidden="true">
                 <path d="M14 4h6v6M20 4l-8.5 8.5" />
-                <path d="M18 13.5V19a1.5 1.5 0 0 1-1.5 1.5h-11A1.5 1.5 0 0 1 4 19V8a1.5 1.5 0 0 1 1.5-1.5H11" />
+                <path
+                  d="M18 13.5V19a1.5 1.5 0 0 1-1.5 1.5h-11A1.5 1.5 0 0 1 4 19V8a1.5 1.5 0 0 1 1.5-1.5H11"
+                />
               </svg>
             </button>
-            <button id="fullscreen" class="btn" data-tip="Tela cheia" aria-label="Tela cheia" hidden>
+            <button
+              id="fullscreen"
+              class="btn"
+              data-tip="Tela cheia"
+              aria-label="Tela cheia"
+              hidden
+            >
               <svg viewBox="0 0 24 24" aria-hidden="true">
                 <path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5" />
               </svg>

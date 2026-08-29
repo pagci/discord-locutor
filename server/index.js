@@ -12,6 +12,7 @@ import * as R from './rooms.js';
 import { systemSnapshot, startSampling } from './system.js';
 import { buildAdminDashboard, mergeAdminDashboards } from './admin.js';
 import { basePathFor, nodeFor, shardKey, stripNode } from '../shared/shard.js';
+import { startWebTransport } from './webtransport.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 dotenv.config({ path: path.join(__dirname, '..', '.env') });
@@ -222,7 +223,19 @@ app.use((req, res, next) => {
 // corpo, não em cookie, então liberar cookie aqui só ampliaria a superfície sem
 // habilitar nada. O painel admin, que é o único que usa cookie, não atravessa
 // máquina nenhuma.
-const ORIGENS_OK = new Set(FATIADO ? [...ORIGENS, PUBLIC_ORIGIN] : []);
+const WT_PUBLIC_ORIGIN = (() => {
+  try {
+    return new URL(process.env.WEBTRANSPORT_PUBLIC_URL).origin;
+  } catch {
+    return null;
+  }
+})();
+const ORIGENS_OK = new Set([PUBLIC_ORIGIN, ...ORIGENS, WT_PUBLIC_ORIGIN].filter(Boolean));
+
+function origemPermitida(origin, { required = false } = {}) {
+  if (!origin) return !required;
+  return ORIGENS_OK.has(String(origin));
+}
 
 app.use((req, res, next) => {
   // Numa máquina só não há origem cruzada para permitir, e o middleware sai
@@ -945,6 +958,17 @@ app.get('/auth/callback', async (req, res) => {
 
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
 
+let webtransport = null;
+app.get('/api/transports', (_req, res) => {
+  res.setHeader('Cache-Control', 'no-store');
+  res.json({
+    websocket: true,
+    node: EU,
+    shards: NOS,
+    webtransport: webtransport?.capability() ?? null,
+  });
+});
+
 /**
  * Servidores ICE para a conexão direta entre quem transmite e quem assiste.
  *
@@ -1220,7 +1244,13 @@ const server = createServer(app);
 // maxPayload: o relay repassa o buffer intacto para todos os espectadores, então
 // um quadro gigante de um transmissor adulterado sairia multiplicado por N. Um
 // keyframe 1080p a 5 Mbps não passa de algumas centenas de KB.
-const wss = new WebSocketServer({ noServer: true, maxPayload: 4 * 1024 * 1024 });
+// perMessageDeflate desligado: mídia H.264/Opus já vem entropicamente comprimida —
+// zlib não tira um byte dela, só gasta CPU e adiciona latência quadro a quadro.
+const wss = new WebSocketServer({
+  noServer: true,
+  maxPayload: 4 * 1024 * 1024,
+  perMessageDeflate: false,
+});
 
 server.on('upgrade', (req, socket, head) => {
   // O proxy do Discord entrega o caminho com o prefixo /.proxy/, e a borda do
@@ -1230,6 +1260,12 @@ server.on('upgrade', (req, socket, head) => {
   const { index: no, path: pathname } = stripNode(semProxy);
 
   if (pathname !== '/ws') {
+    socket.destroy();
+    return;
+  }
+
+  if (!origemPermitida(req.headers.origin)) {
+    socket.write('HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n');
     socket.destroy();
     return;
   }
@@ -1272,7 +1308,7 @@ server.on('upgrade', (req, socket, head) => {
   });
 });
 
-wss.on('connection', (ws, _req, auth, fonte, controle) => {
+function dispatchConnection(ws, auth, fonte, controle) {
   ws.__connectedAt = Date.now();
   ws.__rttMs = null;
   ws.__pingSentAt = null;
@@ -1292,7 +1328,31 @@ wss.on('connection', (ws, _req, auth, fonte, controle) => {
   } else {
     handleViewer(ws, room, auth);
   }
+}
+
+wss.on('connection', (ws, _req, auth, fonte, controle) => {
+  dispatchConnection(ws, auth, fonte, controle);
 });
+
+webtransport = await startWebTransport({
+  env: process.env,
+  production: isProd,
+  node: EU,
+  sharded: FATIADO,
+  allowedOrigins: ORIGENS_OK,
+  sources: R.FONTES,
+  verifyToken,
+  nodeForToken: (auth) => noDaChave(chaveDe(auth)),
+  roomExists: (roomId) => Boolean(R.getRoom(roomId)),
+  onConnection: dispatchConnection,
+  onState: ({ state, host, port, reason }) => {
+    const address = host && port ? ` UDP ${host}:${port}` : '';
+    const detail = reason ? ` (${reason})` : '';
+    console.info(`[webtransport] ${state}${address}${detail}`);
+  },
+  onError: (error) => console.warn(`[webtransport] ${error?.message ?? error}`),
+});
+server.on('close', () => webtransport.stop());
 
 /**
  * A aba de captura, sem mídia nenhuma: só recebe recados.
@@ -1325,6 +1385,11 @@ function handleBroadcaster(ws, room, info, fonte) {
     return;
   }
 
+  // WebTransport rejects media at the header boundary until the authenticated
+  // broadcaster owns a concrete slot. Viewers/control sockets never receive
+  // this capability, so valid framing cannot become unauthorized lane state.
+  ws.authorizeMediaSlot?.(entry.slot);
+
   console.log(
     `[room ${room.id}] broadcaster conectado: ${info.name} · ${fonte} (slot ${entry.slot})`,
   );
@@ -1345,12 +1410,20 @@ function handleBroadcaster(ws, room, info, fonte) {
     if (msg.type === 'start') {
       R.startStream(room, entry);
       console.log(`[room ${room.id}] stream iniciada por ${info.name}`);
+    } else if (msg.type === 'resume') {
+      R.resumeStream(room, entry);
+      console.log(`[room ${room.id}] stream retomada por ${info.name}`);
     } else if (msg.type === 'config' && msg.config) {
       R.setConfig(room, entry, msg.config);
       console.log(`[room ${room.id}] codec de ${info.name}: ${msg.config.codec}`);
     } else if (msg.type === 'audio-config' && msg.config) {
       R.setAudioConfig(room, entry, msg.config);
       console.log(`[room ${room.id}] audio de ${info.name}: ${msg.config.codec}`);
+    } else if (msg.type === 'quality') {
+      // O transmissor é dono da escada de qualidade; o servidor espelha o que
+      // ele reporta em vez de manter uma cópia própria que possa divergir.
+      // `setQuality` valida a forma na fronteira e ignora o que vier torto.
+      R.setQuality(room, entry, msg);
     } else if (msg.type === 'rtc' && typeof msg.peer === 'string' && msg.payload) {
       R.rtcParaViewer(room, entry, msg.peer, msg.payload);
     } else if (msg.type === 'stop') {
@@ -1360,13 +1433,18 @@ function handleBroadcaster(ws, room, info, fonte) {
   });
 
   ws.on('close', () => {
-    R.detachBroadcaster(room, ws);
-    console.log(`[room ${room.id}] broadcaster saiu: ${info.name}`);
+    const aguardando = R.suspendBroadcaster(room, ws);
+    console.log(
+      `[room ${room.id}] broadcaster ${aguardando ? 'reconectando' : 'saiu'}: ${info.name}`,
+    );
   });
 }
 
 function handleViewer(ws, room, auth) {
   R.attachViewer(room, ws, { id: auth.uid, name: auth.name, avatar: auth.av ?? null });
+
+  ws.on('media-drop', (slot) => R.pedirKeyframe(room, ws, slot));
+  ws.on('transport-diagnostic', (event) => R.reportarPressaoTransporte(room, ws, event));
 
   ws.on('message', (data, isBinary) => {
     if (isBinary) return;
@@ -1392,6 +1470,13 @@ function handleViewer(ws, room, auth) {
 
     if (msg.type === 'unwatch' && Number.isInteger(msg.slot)) {
       R.unwatch(room, ws, msg.slot);
+      return;
+    }
+
+    // O transporte dele detectou buraco de mídia e o decodificador ficou sem
+    // referência. Quem valida quem pode pedir o quê é o registro da sala.
+    if (msg.type === 'need-keyframe') {
+      R.pedirKeyframe(room, ws, msg.slot);
       return;
     }
 

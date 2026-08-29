@@ -548,14 +548,141 @@ describe('pushChunk', () => {
 
   describe('contrapressão', () => {
     /** Um espectador cujo socket já está entupido. */
-    function entupido(bytes) {
-      const { room, entry } = comTransmissao({ assistindo: false });
+    function entupido(bytes, contexto = null) {
+      const base = contexto ?? comTransmissao({ assistindo: false });
+      const { room, entry } = base;
       const lento = socket({ buffered: bytes });
       R.attachViewer(room, lento, pessoa('lento'));
       R.watch(room, lento, entry.slot);
       lento.limpar();
+      entry.ws.limpar();
       return { room, entry, lento };
     }
+
+    /**
+     * Uma stream sob relógio controlado com taxa de chegada conhecida:
+     * dez quadros de 100 000 bytes espaçados 100 ms => 1 MB/s de mídia,
+     * orçamento de 300 000 bytes (0,3 s), bem acima do piso em bytes.
+     */
+    function comTaxaConhecida() {
+      vi.useFakeTimers();
+      const contexto = comTransmissao({ assistindo: false });
+      for (let i = 0; i < 10; i++) {
+        R.pushChunk(contexto.room, contexto.entry, quadro(contexto.entry.slot, KEYFRAME, 100_000));
+        vi.advanceTimersByTime(100);
+      }
+      contexto.entry.ws.limpar();
+      return contexto;
+    }
+
+    it('descarta o delta quando a fila passa de alguns décimos de segundo de mídia', () => {
+      try {
+        // A 1 MB/s o orçamento é 300 000 bytes; 400 000 passaram dele. No
+        // teto antigo, de 2 MB, a fila tinha segundos de folga para crescer
+        // antes de qualquer descarte.
+        const { room, entry, lento } = entupido(400_000, comTaxaConhecida());
+        lento.__primed.add(entry.slot);
+
+        R.pushChunk(room, entry, quadro(entry.slot, DELTA));
+
+        expect(lento.binarios()).toHaveLength(0);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('deixa passar o que cabe no orçamento de tempo', () => {
+      try {
+        const { room, entry, lento } = entupido(200_000, comTaxaConhecida());
+
+        R.pushChunk(room, entry, quadro(entry.slot, KEYFRAME));
+        R.pushChunk(room, entry, quadro(entry.slot, DELTA));
+
+        expect(lento.binarios()).toHaveLength(2);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('dá ao keyframe o dobro de folga, porque sem ele a tela não volta', () => {
+      try {
+        const { room, entry, lento } = entupido(500_000, comTaxaConhecida());
+
+        R.pushChunk(room, entry, quadro(entry.slot, KEYFRAME));
+
+        expect(lento.binarios()).toHaveLength(1);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('mas nem o keyframe passa quando a fila estourou o dobro', () => {
+      try {
+        const { room, entry, lento } = entupido(650_000, comTaxaConhecida());
+        // O watch já pediu um keyframe; o pedido seguinte só sai depois do
+        // intervalo de proteção do transmissor.
+        vi.advanceTimersByTime(1100);
+        entry.ws.limpar();
+
+        R.pushChunk(room, entry, quadro(entry.slot, KEYFRAME));
+
+        expect(lento.binarios()).toHaveLength(0);
+        expect(entry.droppedChunks).toBe(1);
+        // Sem este keyframe ele segue sem ponto de partida: pede outro.
+        expect(entry.ws.tipos()).toContain('need-keyframe');
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('WebTransport admite a ancora fria que o wire usa para aposentar deltas', () => {
+      try {
+        const { room, entry, lento } = entupido(650_000, comTaxaConhecida());
+        lento.transport = 'webtransport';
+        expect(lento.__primed.has(entry.slot)).toBe(false);
+
+        R.pushChunk(room, entry, quadro(entry.slot, KEYFRAME, 100_000));
+
+        expect(lento.binarios()).toHaveLength(1);
+        expect(lento.__primed.has(entry.slot)).toBe(true);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('WebTransport delega ao wire o teto temporal de deltas e audio', () => {
+      try {
+        const { room, entry, lento } = entupido(400_000, comTaxaConhecida());
+        lento.transport = 'webtransport';
+        lento.__primed.add(entry.slot);
+
+        R.pushChunk(room, entry, quadro(entry.slot, DELTA));
+        R.pushChunk(room, entry, quadro(entry.slot, AUDIO));
+
+        // O adapter QUIC ja limita esses datagramas por quantidade, bytes e
+        // idade. Aplicar aqui tambem o teto de bufferedAmount do WebSocket
+        // descarta antes da fila cancelavel e transforma pressao em espera por
+        // keyframe, em vez de preservar a midia mais fresca.
+        expect(lento.binarios()).toHaveLength(2);
+        expect(lento.__primed.has(entry.slot)).toBe(true);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('stream sem medida ainda tem um piso em bytes', () => {
+      // Recém-começada: o contador de tráfego não tem amostra, e o orçamento
+      // cai no piso (96 KB). 100 KB passam dele; 50 KB cabem.
+      const entupida = entupido(100_000);
+      R.pushChunk(entupida.room, entupida.entry, quadro(entupida.entry.slot, KEYFRAME));
+      R.pushChunk(entupida.room, entupida.entry, quadro(entupida.entry.slot, DELTA));
+      expect(entupida.lento.binarios()).toHaveLength(1);
+
+      const folgada = entupido(50_000);
+      R.pushChunk(folgada.room, folgada.entry, quadro(folgada.entry.slot, KEYFRAME));
+      R.pushChunk(folgada.room, folgada.entry, quadro(folgada.entry.slot, DELTA));
+      expect(folgada.lento.binarios()).toHaveLength(2);
+    });
 
     it('descarta o delta de quem não vaza a fila', () => {
       const { room, entry, lento } = entupido(3 * 1024 * 1024);
@@ -574,14 +701,6 @@ describe('pushChunk', () => {
 
       expect(lento.binarios()).toHaveLength(0);
       expect(room.droppedChunks).toBe(1);
-    });
-
-    it('dá ao keyframe o dobro de folga, porque sem ele a tela não volta', () => {
-      const { room, entry, lento } = entupido(3 * 1024 * 1024);
-
-      R.pushChunk(room, entry, quadro(entry.slot, KEYFRAME));
-
-      expect(lento.binarios()).toHaveLength(1);
     });
 
     it('mas nem o keyframe passa quando a fila estourou de vez', () => {
@@ -638,6 +757,45 @@ describe('stopStream e detachBroadcaster', () => {
     R.detachBroadcaster(room, ws);
 
     expect(room.broadcasters.size).toBe(1);
+  });
+
+  it('preserva slot e watches quando o transmissor reconecta na carência', () => {
+    vi.useFakeTimers();
+    try {
+      const { room, viewer, ws, entry } = comTransmissao();
+      const novo = socket();
+
+      expect(R.suspendBroadcaster(room, ws)).toBe(true);
+      const retomada = R.attachBroadcaster(room, novo, pessoa('transmissor'));
+
+      expect(retomada).toBe(entry);
+      expect(retomada.ws).toBe(novo);
+      expect(retomada.slot).toBe(entry.slot);
+      expect(viewer.__watching.has(entry.slot)).toBe(true);
+      expect(viewer.tipos()).not.toContain('stream-stop');
+      expect(novo.mensagens()).toContainEqual({ type: 'slot', slot: entry.slot });
+
+      vi.advanceTimersByTime(8001);
+      expect(room.broadcasters.get(entry.chave)).toBe(entry);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('encerra de verdade quando a carência de reconexão expira', () => {
+    vi.useFakeTimers();
+    try {
+      const { room, viewer, ws, entry } = comTransmissao();
+
+      expect(R.suspendBroadcaster(room, ws)).toBe(true);
+      vi.advanceTimersByTime(8001);
+
+      expect(room.broadcasters.has(entry.chave)).toBe(false);
+      expect(room.slots.has(entry.slot)).toBe(false);
+      expect(viewer.tipos()).toContain('stream-stop');
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 
@@ -924,6 +1082,27 @@ describe('WebRTC', () => {
 
     R.pushChunk(room, entry, quadro(entry.slot, KEYFRAME));
     expect(viewer.binarios()).toHaveLength(1);
+  });
+
+  it('coalesce alternância rtc-ativo sem inundar chunks nem keyframes', () => {
+    vi.useFakeTimers();
+    try {
+      const { room, viewer, ws, entry } = comTransmissao();
+      ws.limpar();
+
+      for (let i = 0; i < 100; i++) {
+        R.rtcAtivo(room, viewer, entry.slot, true);
+        R.rtcAtivo(room, viewer, entry.slot, false);
+      }
+
+      expect(ws.tipos().filter((tipo) => tipo === 'need-keyframe')).toHaveLength(1);
+      expect(ws.tipos().filter((tipo) => tipo === 'chunks')).toHaveLength(1);
+      vi.advanceTimersByTime(100);
+      expect(ws.tipos().filter((tipo) => tipo === 'need-keyframe')).toHaveLength(1);
+      expect(ws.tipos().filter((tipo) => tipo === 'chunks')).toHaveLength(2);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('desliga o relay na origem quando ninguém mais depende dele', () => {

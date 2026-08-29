@@ -9,8 +9,17 @@ import {
   resumoPeer,
   MORTO,
   PRAZO_CONEXAO_MS,
+  politicaIceDaUrl,
 } from '../../shared/rtc.js';
 import { basePathFor, nodeFor, shardKey } from '../../shared/shard.js';
+import { createTransport } from '../../shared/transport.js';
+import {
+  DEFAULT_STREAM_SETTINGS,
+  normalizeStreamSettings,
+  streamSettingsToQuery,
+} from '../../shared/stream-quality.js';
+import { createArrivalQualityGate, formatBitrate } from './quality-gate.js';
+import { relayTransportLabel, rtcTransportLabel } from './transport-label.js';
 
 const $ = (id) => document.getElementById(id);
 
@@ -103,7 +112,26 @@ const streams = new Map(); // slot -> { userId, canvas, player }
 // sem pedir, o servidor nem envia os quadros — a economia de banda depende
 // disso, filtrar só na exibição gastaria a mesma saída.
 const available = new Map(); // slot -> { userId, config }
-const watching = new Set(); // slots que eu pedi para assistir
+
+/**
+ * O que eu quero assistir — a intenção, não o que já foi pedido ao servidor.
+ *
+ * slot -> { userId, geracao }, e `geracao` é a conexão em que o `watch` desse
+ * slot chegou a sair. A intenção sobrevive a uma queda de socket, o pedido não:
+ * o servidor esquece tudo quando a conexão morre, então cada reconexão precisa
+ * refazê-lo. Guardar as duas coisas no mesmo lugar é o que impede o par de
+ * divergir — sem `geracao` só sobraria uma bandeira global de "já reenviei",
+ * que erra em cada reconexão seguinte.
+ *
+ * O `userId` está aqui porque intenção é sobre uma TRANSMISSÃO, não sobre um
+ * número: o slot é reciclado, e uma tela nova que caísse no mesmo slot durante
+ * a queda seria assistida sem ninguém ter pedido.
+ */
+const watching = new Map();
+
+// Cada `connect()` abre uma conexão nova, e o servidor do outro lado nasce sem
+// memória nenhuma da anterior.
+let geracaoConexao = 0;
 
 // Quem tem aba de captura aberta, segundo o servidor. É o que decide entre
 // falar com a aba existente e abrir outra.
@@ -115,6 +143,21 @@ let clientId = null;
 let ws = null;
 let participants = [];
 let reconnectDelay = 1000;
+let relayTransport = null;
+let relayFallback = null;
+let relayWtAttempted = false;
+
+// `connectionState=connected` não garante que a mídia ainda esteja chegando.
+// Depois desta janela sem avanço nos contadores RTP, o relay volta a assumir.
+const RTC_SEM_MIDIA_MS = 5000;
+const RTC_VIGIA_MS = 1000;
+// O relay pode continuar OPEN depois que a fila QUIC deixa de entregar mídia.
+// A captura normalmente produz vídeo continuamente; três segundos sem sequer
+// um byte novo são um sinal mais forte que mudança visual (uma tela pode ser
+// legitimamente estática). O pedido é barato, coalescido novamente no servidor
+// e também rearma a proteção FEC da lane afetada.
+const RELAY_SEM_MIDIA_MS = 1000;
+const RELAY_PEDIDO_KEYFRAME_MS = 1000;
 
 // Apertos de mão recusados em sequência, sem nenhum ter aberto. Zera assim que
 // um abre. É o contador do freio lá no `close` — ver a nota longa por lá.
@@ -258,11 +301,28 @@ function medidaDe(s) {
   return { w: s.canvas.width, h: s.canvas.height };
 }
 
+/**
+ * Leva a intenção de assistir um slot até o servidor — no máximo uma vez por
+ * conexão.
+ *
+ * A guarda é a comparação com `geracaoConexao`, e não um "já pedi" solto: ela
+ * responde à pergunta certa, que é "esta conexão já ouviu falar deste slot?".
+ * Um `state` repetido não vira um segundo `watch`, e uma conexão nova sempre
+ * vira exatamente um.
+ */
+function enviarWatch(slot) {
+  const alvo = watching.get(slot);
+  if (!alvo || alvo.geracao === geracaoConexao) return;
+  if (!ws || ws.readyState !== 1) return;
+  alvo.geracao = geracaoConexao;
+  ws.send(JSON.stringify({ type: 'watch', slot }));
+}
+
 function watchSlot(slot) {
   const info = available.get(slot);
   if (!info) return;
-  watching.add(slot);
-  ws?.send(JSON.stringify({ type: 'watch', slot }));
+  watching.set(slot, { userId: info.userId, geracao: null });
+  enviarWatch(slot);
   // O config pode já ter chegado; se não, ele chega logo e dispara o start.
   if (info.config) {
     openStream(slot, info.userId);
@@ -575,6 +635,7 @@ function buildTile(p, { palco = false, semVideo = false, slot: slotDado = null }
     if (palco) telaCheia = !telaCheia;
     else activeSlot = slot;
     renderGrid();
+    mostrarViaAtiva();
   };
 
   if (stream) {
@@ -935,6 +996,30 @@ function buildPeopleList() {
   return list;
 }
 
+/**
+ * Diz na barra que a rede de quem assiste fez a qualidade cair.
+ *
+ * Mora fora do `#people` justamente porque `renderBar()` reconstrói aquele
+ * elemento a cada atualização de sala: aqui o aviso sobrevive às atualizações e
+ * só sai quando a qualidade volta. Um `toast()` seria mais fácil e estaria
+ * errado — ele some, e a redução não.
+ */
+function mostrarQualidadeAutomatica({ degraus, bitrate, fps, fpsEfetivo } = {}) {
+  const el = document.querySelector('[data-quality-auto]');
+  if (!el) return;
+
+  if (!degraus) {
+    el.hidden = true;
+    el.textContent = '';
+    return;
+  }
+
+  const mbps = Number(bitrate ?? 0) / 1e6;
+  const taxa = fpsEfetivo ?? fps;
+  el.hidden = false;
+  el.textContent = `Rede apertada: qualidade reduzida para ${mbps.toFixed(1)} Mb/s · ${taxa} fps`;
+}
+
 function renderBar() {
   $('people').replaceChildren();
   $('people').insertAdjacentHTML(
@@ -977,6 +1062,97 @@ function renderBar() {
   renderProfileButton();
 
   $('pWho').textContent = casters.length ? casters.map((p) => p.name).join(', ') : 'ninguém';
+  mostrarViaAtiva();
+}
+
+function nomeDoRelay() {
+  return relayTransportLabel({
+    transport: relayTransport,
+    attemptedWebTransport: relayWtAttempted,
+    fallbackReason: relayFallback,
+  });
+}
+
+function nomeDoRtc(s) {
+  return rtcTransportLabel({ relay: s.rtcRelay, protocol: s.rtcProtocol });
+}
+
+function mostrarQualityGate(s) {
+  const badge = $('qualityBadge');
+  if (!badge) return;
+  if (!s) {
+    badge.hidden = true;
+    badge.textContent = '';
+    return;
+  }
+
+  const result = s.qualityLastResult;
+  const sample = s.qualityLastSample;
+  const state = result?.state ?? 'measuring';
+  const label = { pass: 'PASS', fail: 'FALHOU', measuring: 'MEDINDO' }[state];
+  const received = sample
+    ? `${formatBitrate(sample.bitrateBps)} · ${Number(sample.fps).toFixed(1)} fps`
+    : 'aguardando amostra';
+  const target = s.qualityTarget
+    ? `alvo ${formatBitrate(s.qualityTarget.bitrate)} · ${s.qualityTarget.fps} fps`
+    : 'alvo não informado';
+  const reasons = result?.reasons?.length ? ` · ${result.reasons.join(', ')}` : '';
+  const resolution =
+    s.video.videoWidth > 0 && s.video.videoHeight > 0
+      ? `${s.video.videoWidth}×${s.video.videoHeight}`
+      : null;
+  const diagnostics = [
+    resolution ? `res ${resolution}` : null,
+    Number.isFinite(sample?.packetLossPct) ? `perda ${sample.packetLossPct.toFixed(1)}%` : null,
+    Number.isFinite(sample?.jitterMs) ? `jitter ${sample.jitterMs.toFixed(1)} ms` : null,
+    Number.isFinite(sample?.droppedFramesPct)
+      ? `descarte ${sample.droppedFramesPct.toFixed(1)}%`
+      : null,
+  ].filter(Boolean);
+
+  badge.hidden = false;
+  badge.dataset.state = state;
+  badge.dataset.bitrateBps = Number.isFinite(sample?.bitrateBps) ? String(sample.bitrateBps) : '';
+  badge.dataset.fps = Number.isFinite(sample?.fps) ? String(sample.fps) : '';
+  badge.dataset.packetLossPct = Number.isFinite(sample?.packetLossPct)
+    ? String(sample.packetLossPct)
+    : '';
+  badge.dataset.jitterMs = Number.isFinite(sample?.jitterMs) ? String(sample.jitterMs) : '';
+  badge.dataset.droppedFramesPct = Number.isFinite(sample?.droppedFramesPct)
+    ? String(sample.droppedFramesPct)
+    : '';
+  badge.textContent = `Quality gate: ${label} · chegada ${received} · ${target}${diagnostics.length ? ` · ${diagnostics.join(' · ')}` : ''}${reasons}`;
+  badge.title = badge.textContent;
+  if ($('pBitrate')) $('pBitrate').textContent = sample ? formatBitrate(sample.bitrateBps) : '—';
+  if ($('pQualityGate')) $('pQualityGate').textContent = label;
+}
+
+function resetQualityMeasurement(s) {
+  s.rtcQualityPrevious = null;
+  s.relayQualityPrevious = null;
+  s.qualityLastSample = null;
+  s.qualityLastResult = null;
+  s.qualityGate.reset();
+}
+
+/** Método da transmissão em destaque, sempre visível sem atalho escondido. */
+function mostrarViaAtiva() {
+  const badge = $('viaBadge');
+  // O Discord pode manter o HTML anterior e carregar o bundle novo pelo nome
+  // fixo. A checagem de versão já pede reabertura; até lá, não derruba a sala.
+  if (!badge) return;
+  const s = streams.get(activeSlot) ?? streams.values().next().value;
+  badge.hidden = !s;
+  if (!s) {
+    badge.textContent = '';
+    return;
+  }
+
+  if (s.viaRtc) badge.textContent = `Método: ${nomeDoRtc(s)}`;
+  else if (s.pc) badge.textContent = `Método: ${nomeDoRelay()} · negociando WebRTC direto…`;
+  else badge.textContent = `Método: ${nomeDoRelay()}`;
+  badge.title = badge.textContent;
+  mostrarQualityGate(s);
 }
 
 // ------------------------------------------------------------------- streams
@@ -1008,11 +1184,34 @@ function openStream(slot, userId) {
     // e não o estado do RTCPeerConnection, que decide o que vai para a tela.
     viaRtc: false,
     prazoRtc: null,
+    vigiaRtc: null,
+    vigiaRtcDeadline: null,
+    vigiaRtcGeracao: 0,
+    rtcInbound: null,
+    rtcUltimoAvanco: 0,
+    rtcRelay: null,
+    rtcProtocol: null,
+    rtcIcePendente: [],
+    rtcRemotaPronta: false,
+    rtcQualityPrevious: null,
+    rtcFrameText: '—',
+    relayVideoBytes: 0,
+    relayUltimoAvanco: performance.now(),
+    relayUltimoPedidoKeyframe: 0,
+    relayQualityPrevious: null,
+    qualityTarget: available.get(slot)?.quality ?? null,
+    qualityGate: createArrivalQualityGate(),
+    qualityLastSample: null,
+    qualityLastResult: null,
     // Vira true no primeiro quadro desenhado. Até lá o tile mostra "Conectando…"
     // em vez de uma caixa preta que não se distingue de um travamento.
     started: false,
     player: createPlayer(canvas, {
       onError: (m) => toast(m, true),
+      onNeedKeyframe: () => {
+        if (ws?.readyState !== 1 || !watching.has(slot)) return;
+        ws.send(JSON.stringify({ type: 'need-keyframe', slot }));
+      },
       onTamanho: () => {
         s.started = true;
         renderGrid();
@@ -1046,6 +1245,8 @@ function startStream(slot, config) {
   // gastaria memória de GPU para desenhar num canvas que ninguém está vendo.
   if (s.viaRtc) return;
   if (!s.player.start(config)) return;
+  s.relayUltimoAvanco = performance.now();
+  s.relayUltimoPedidoKeyframe = 0;
   renderGrid();
   renderBar();
   ensureStatsTimer();
@@ -1071,7 +1272,9 @@ function endStream(slot) {
   if (streams.size === 0) {
     clearInterval(lagTimer);
     lagTimer = null;
-    for (const id of ['pLag', 'pFps', 'pRes']) $(id).textContent = '—';
+    for (const id of ['pLag', 'pFps', 'pBitrate', 'pQualityGate', 'pRes'])
+      if ($(id)) $(id).textContent = '—';
+    mostrarQualityGate(null);
   }
 
   renderGrid();
@@ -1113,6 +1316,7 @@ async function receberOferta(slot, sdp) {
 
     const pc = criarPeer({
       ice,
+      iceTransportPolicy: politicaIceDaUrl(),
       onIce: (candidate) => enviarRtc(slot, { kind: 'ice', candidate }),
       onEstado: (estado) => {
         if (MORTO.has(estado)) desistirDoRtc(slot);
@@ -1125,8 +1329,19 @@ async function receberOferta(slot, sdp) {
       },
     });
     s.pc = pc;
+    renderBar();
 
     await pc.setRemoteDescription(sdp);
+    if (streams.get(slot) !== s || s.pc !== pc) return;
+    s.rtcRemotaPronta = true;
+    const pendentes = s.rtcIcePendente.splice(0);
+    for (const candidate of pendentes) {
+      try {
+        await pc.addIceCandidate(candidate);
+      } catch (err) {
+        console.warn('[rtc]', err.message);
+      }
+    }
     const answer = await pc.createAnswer();
     await pc.setLocalDescription(answer);
     enviarRtc(slot, { kind: 'answer', sdp: pc.localDescription });
@@ -1147,8 +1362,15 @@ async function receberOferta(slot, sdp) {
 }
 
 async function receberIce(slot, candidate) {
-  const pc = streams.get(slot)?.pc;
-  if (!pc || !candidate) return;
+  const s = streams.get(slot);
+  if (!s || !candidate) return;
+  const pc = s.pc;
+  if (!pc || !s.rtcRemotaPronta) {
+    // A oferta já chegou pelo mesmo WebSocket, mas receberOferta pode estar
+    // esperando /api/ice ou setRemoteDescription. Não descarta o trickle ICE.
+    if (s.rtcIcePendente.length < 64) s.rtcIcePendente.push(candidate);
+    return;
+  }
   try {
     await pc.addIceCandidate(candidate);
   } catch (err) {
@@ -1175,6 +1397,8 @@ function assumirRtc(slot) {
   // play de volta é barato e é o que evita a tela congelar no primeiro quadro.
   s.video.play().catch(() => {});
   s.started = true;
+  resetQualityMeasurement(s);
+  iniciarVigiaRtc(slot, s);
 
   aplicarVolume(slot);
   ws?.send(JSON.stringify({ type: 'rtc-ativo', slot, on: true }));
@@ -1202,6 +1426,7 @@ function desistirDoRtc(slot) {
     s.started = false;
     const config = available.get(slot)?.config;
     if (config) s.player.start(config);
+    resetQualityMeasurement(s);
     renderGrid();
     renderBar();
   }
@@ -1209,10 +1434,122 @@ function desistirDoRtc(slot) {
   if (watching.has(slot)) ws?.send(JSON.stringify({ type: 'rtc-ativo', slot, on: false }));
 }
 
+function amostraInboundVideo(stats) {
+  let achou = false;
+  const total = { packets: 0, bytes: 0, frames: 0 };
+  for (const item of stats?.values?.() ?? []) {
+    if (item.type !== 'inbound-rtp' || (item.kind ?? item.mediaType) !== 'video') continue;
+    achou = true;
+    total.packets += Number(item.packetsReceived) || 0;
+    total.bytes += Number(item.bytesReceived) || 0;
+    total.frames += Number(item.framesDecoded) || 0;
+  }
+  return achou ? total : null;
+}
+
+function avancouInbound(anterior, atual) {
+  return (
+    atual.packets > anterior.packets ||
+    atual.bytes > anterior.bytes ||
+    atual.frames > anterior.frames
+  );
+}
+
+function pararVigiaRtc(s) {
+  clearInterval(s.vigiaRtc);
+  clearTimeout(s.vigiaRtcDeadline);
+  s.vigiaRtc = null;
+  s.vigiaRtcDeadline = null;
+  // Invalida também callbacks/promises que já saíram da fila do timer. Sem
+  // uma geração, o finally de um peer antigo pode interferir no vigia novo.
+  s.vigiaRtcGeracao += 1;
+  s.rtcInbound = null;
+  s.rtcUltimoAvanco = 0;
+}
+
+/**
+ * Detecta um peer ainda conectado que deixou de entregar RTP. Os contadores de
+ * transporte, em vez de mudança visual, preservam telas legitimamente estáticas.
+ */
+function iniciarVigiaRtc(slot, s) {
+  pararVigiaRtc(s);
+  const geracao = s.vigiaRtcGeracao;
+  const pc = s.pc;
+  let ocupada = false;
+  let leituraIniciadaEm = null;
+
+  const vigente = () =>
+    streams.get(slot) === s && s.viaRtc && s.pc === pc && s.vigiaRtcGeracao === geracao;
+
+  const armarDeadline = (agora) => {
+    if (!vigente()) return;
+    s.rtcUltimoAvanco = agora;
+    clearTimeout(s.vigiaRtcDeadline);
+    let gracaConsumida = false;
+    const vencer = () => {
+      if (!vigente()) return;
+
+      // Uma leitura que começou no último ciclo pode conter o progresso que
+      // aconteceu no limite da janela. Ela ganha somente o restante desse ciclo;
+      // uma promise pendurada desde cedo já esgotou a tolerância e cai agora.
+      if (!gracaConsumida && ocupada && leituraIniciadaEm !== null) {
+        const restante = RTC_VIGIA_MS - (performance.now() - leituraIniciadaEm);
+        if (restante > 0) {
+          gracaConsumida = true;
+          s.vigiaRtcDeadline = setTimeout(vencer, Math.ceil(restante) + 1);
+          return;
+        }
+      }
+
+      console.warn('[rtc] mídia parou; voltando ao relay', { slot });
+      desistirDoRtc(slot);
+    };
+
+    // Um milissegundo de folga deixa o probe marcado exatamente em 5 s nascer
+    // antes do veredito. `vencer` limita qualquer espera adicional a um ciclo.
+    s.vigiaRtcDeadline = setTimeout(vencer, RTC_SEM_MIDIA_MS + 1);
+  };
+
+  armarDeadline(performance.now());
+
+  s.vigiaRtc = setInterval(async () => {
+    if (!vigente() || ocupada) return;
+    ocupada = true;
+    leituraIniciadaEm = performance.now();
+
+    try {
+      const stats = await pc.getStats();
+      if (!vigente()) return;
+
+      const agora = performance.now();
+      const atual = amostraInboundVideo(stats);
+      if (atual && s.rtcInbound && avancouInbound(s.rtcInbound, atual)) {
+        armarDeadline(agora);
+      }
+      s.rtcInbound = atual;
+      updateRtcQualityFromStats(s, pc, stats);
+    } catch {
+      // Uma leitura isolada não derruba a mídia. Rejeições repetidas e promises
+      // penduradas também não desarmam o deadline independente acima.
+    } finally {
+      // `ocupada` pertence a esta geração: uma promise antiga nunca libera o
+      // single-flight do peer que a substituiu.
+      ocupada = false;
+      leituraIniciadaEm = null;
+    }
+  }, RTC_VIGIA_MS);
+}
+
 function fecharPeer(s) {
+  pararVigiaRtc(s);
   clearTimeout(s.prazoRtc);
   s.prazoRtc = null;
   s.viaRtc = false;
+  s.rtcRelay = null;
+  s.rtcProtocol = null;
+  s.rtcIcePendente = [];
+  s.rtcRemotaPronta = false;
+  s.rtcQualityPrevious = null;
   s.video.srcObject = null;
   s.video.muted = true;
   if (!s.pc) return;
@@ -1237,19 +1574,130 @@ function enviarRtc(slot, payload) {
  */
 function quadrosDoVideo(s) {
   const q = s.video.getVideoPlaybackQuality?.();
-  if (!q) return '—';
+  if (!q) return { fps: null, dropped: null, text: '—' };
   const total = q.totalVideoFrames;
   const n = total - (s.quadrosAntes ?? total);
   s.quadrosAntes = total;
   // Quadro descartado pelo navegador é exatamente a micro-travada que se vê.
   const perdidos = q.droppedVideoFrames - (s.perdidosAntes ?? q.droppedVideoFrames);
   s.perdidosAntes = q.droppedVideoFrames;
-  return perdidos > 0 ? `${n} fps · ${perdidos} perdidos` : `${n} fps`;
+  return {
+    fps: n,
+    dropped: perdidos,
+    text: perdidos > 0 ? `${n} fps · ${perdidos} perdidos` : `${n} fps`,
+  };
+}
+
+function rtcQualitySnapshot(stats) {
+  const byId = new Map();
+  for (const item of stats?.values?.() ?? []) byId.set(item.id, item);
+
+  const total = { bytes: 0, frames: 0, packetsReceived: 0, packetsLost: 0, jitterMs: null };
+  let found = false;
+  let relay = null;
+  let protocol = null;
+  let rtt = null;
+  for (const item of byId.values()) {
+    if (item.type === 'inbound-rtp' && (item.kind ?? item.mediaType) === 'video') {
+      found = true;
+      total.bytes += Number(item.bytesReceived) || 0;
+      total.frames += Number(item.framesDecoded) || 0;
+      total.packetsReceived += Number(item.packetsReceived) || 0;
+      total.packetsLost += Number(item.packetsLost) || 0;
+      if (Number.isFinite(item.jitter))
+        total.jitterMs = Math.max(total.jitterMs ?? 0, Number(item.jitter) * 1000);
+    }
+    if (item.type === 'candidate-pair' && item.state === 'succeeded' && item.nominated !== false) {
+      const local = byId.get(item.localCandidateId);
+      if (local?.candidateType) relay = local.candidateType === 'relay';
+      protocol = local?.protocol ?? item.protocol ?? null;
+      if (typeof item.currentRoundTripTime === 'number')
+        rtt = Math.round(item.currentRoundTripTime * 1000);
+    }
+  }
+  return found ? { ...total, relay, protocol, rtt } : null;
+}
+
+function applyQualitySample(s, sample) {
+  s.qualityLastSample = sample;
+  s.qualityLastResult = s.qualityGate.update(sample, s.qualityTarget);
+  const selected = streams.get(activeSlot) ?? streams.values().next().value;
+  if (selected === s) mostrarQualityGate(s);
+}
+
+function updateRtcQualityFromStats(s, pc, stats) {
+  const current = rtcQualitySnapshot(stats);
+  if (!current || !s.viaRtc || s.pc !== pc) return;
+
+  const videoFrames = quadrosDoVideo(s);
+  s.rtcFrameText = videoFrames.text;
+  if (current.relay !== null) s.rtcRelay = current.relay;
+  if (current.protocol) s.rtcProtocol = current.protocol;
+  const selected = streams.get(activeSlot) ?? streams.values().next().value;
+  if (selected === s) mostrarViaAtiva();
+
+  const now = Date.now();
+  const previous = s.rtcQualityPrevious;
+  s.rtcQualityPrevious = { ...current, at: now };
+  if (!previous) {
+    if (selected === s) mostrarQualityGate(s);
+    return;
+  }
+
+  const elapsed = Math.max(1, now - previous.at);
+  const packetDelta = Math.max(0, current.packetsReceived - previous.packetsReceived);
+  const lostDelta = Math.max(0, current.packetsLost - previous.packetsLost);
+  const decodedDelta = Math.max(0, current.frames - previous.frames);
+  const totalPackets = packetDelta + lostDelta;
+  const displayed = Number(videoFrames.fps);
+  const dropped = Number(videoFrames.dropped);
+  applyQualitySample(s, {
+    bitrateBps: (Math.max(0, current.bytes - previous.bytes) * 8 * 1000) / elapsed,
+    fps: decodedDelta
+      ? (decodedDelta * 1000) / elapsed
+      : Number.isFinite(displayed)
+        ? displayed
+        : 0,
+    packetLossPct: totalPackets ? (lostDelta * 100) / totalPackets : 0,
+    jitterMs: current.jitterMs,
+    droppedFramesPct:
+      Number.isFinite(displayed) && Number.isFinite(dropped) && displayed + dropped > 0
+        ? (dropped * 100) / (displayed + dropped)
+        : null,
+  });
+}
+
+function updateRelayQuality(s, fps) {
+  const now = Date.now();
+  const previous = s.relayQualityPrevious;
+  s.relayQualityPrevious = { bytes: s.relayVideoBytes, at: now };
+  if (!previous) {
+    const selected = streams.get(activeSlot) ?? streams.values().next().value;
+    if (selected === s) mostrarQualityGate(s);
+    return;
+  }
+  const elapsed = Math.max(1, now - previous.at);
+  applyQualitySample(s, {
+    bitrateBps: (Math.max(0, s.relayVideoBytes - previous.bytes) * 8 * 1000) / elapsed,
+    fps,
+    packetLossPct: null,
+    droppedFramesPct: null,
+  });
 }
 
 function ensureStatsTimer() {
   if (lagTimer) return;
   lagTimer = setInterval(() => {
+    const agora = performance.now();
+    for (const [slot, relay] of streams) {
+      if (relay.viaRtc || !relay.started || !watching.has(slot)) continue;
+      if (agora - relay.relayUltimoAvanco < RELAY_SEM_MIDIA_MS) continue;
+      if (agora - relay.relayUltimoPedidoKeyframe < RELAY_PEDIDO_KEYFRAME_MS) continue;
+      if (ws?.readyState !== 1) continue;
+      relay.relayUltimoPedidoKeyframe = agora;
+      ws.send(JSON.stringify({ type: 'need-keyframe', slot }));
+    }
+
     const s = streams.get(activeSlot) ?? streams.values().next().value;
     if (!s) return;
 
@@ -1259,24 +1707,33 @@ function ensureStatsTimer() {
     // última medição, o que é pior que não mostrar nada.
     if (s.viaRtc) {
       const m = medidaDe(s);
-      $('pVia').textContent = 'WebRTC (direto)';
+      const pc = s.pc;
+      $('pVia').textContent = nomeDoRtc(s);
+      if ($('pLagLabel')) $('pLagLabel').textContent = 'RTT (ida e volta)';
       $('pRes').textContent = m.w ? `${m.w}×${m.h}` : '—';
-      $('pFps').textContent = quadrosDoVideo(s);
+      $('pFps').textContent = s.rtcFrameText;
       $('pJitter').textContent = 'do WebRTC';
-      resumoPeer(s.pc).then(({ rtt, relay }) => {
-        if (!s.viaRtc) return;
-        $('pLag').textContent = rtt === null ? '—' : `${rtt} ms${relay ? ' · TURN' : ''}`;
+      resumoPeer(pc).then(({ rtt, relay }) => {
+        const selected = streams.get(activeSlot) ?? streams.values().next().value;
+        if (selected !== s || !s.viaRtc || s.pc !== pc) return;
+        if (relay !== null) s.rtcRelay = relay;
+        $('pLag').textContent =
+          rtt === null ? '—' : `${rtt} ms${s.rtcRelay === true ? ' · TURN' : ''}`;
+        mostrarViaAtiva();
       });
     } else {
-      $('pVia').textContent = s.pc ? 'relay (negociando direto…)' : 'relay (WebSocket)';
+      if ($('pLagLabel')) $('pLagLabel').textContent = 'Chegada da rede';
+      $('pVia').textContent = s.pc ? `${nomeDoRelay()} · negociando WebRTC…` : nomeDoRelay();
       $('pLag').textContent = `${Math.max(0, s.player.getLag())} ms`;
-      $('pFps').textContent = `${s.player.takeFrameCount()} fps`;
+      const fps = s.player.takeFrameCount();
+      $('pFps').textContent = `${fps} fps`;
       $('pRes').textContent = s.player.getSizes().video;
       // O número que interessa quando a imagem anda aos saltos sem perder um
       // quadro sequer: o desencontro entre o ritmo em que os quadros foram
       // capturados e o ritmo em que eles chegaram.
       const j = s.player.getJitter();
       $('pJitter').textContent = j === null ? '—' : `${j} ms`;
+      updateRelayQuality(s, fps);
     }
 
     // Quatro estados diferentes que, sem isto, parecem todos "sem som".
@@ -1555,7 +2012,9 @@ async function showLobby() {
   $('leaveRoom').hidden = true;
   $('roomSettings').hidden = true;
   $('share').hidden = true;
+  $('shareSettings').hidden = true;
   $('camera').hidden = true;
+  $('streamQualityModal').hidden = true;
 
   // O dock inteiro sai de cena: todo controle dele é de dentro da sala, e o
   // cabeçalho do lobby já traz perfil e criar sala.
@@ -1729,6 +2188,7 @@ function openRoom(tokens, room) {
   $('lobby').hidden = true;
   $('empty').hidden = false;
   $('share').hidden = false;
+  $('shareSettings').hidden = false;
   $('camera').hidden = false;
   $('people').hidden = false;
   $('loginBtn').hidden = true;
@@ -1966,7 +2426,19 @@ async function post(url, body, { retry = true } = {}) {
 
 function connect() {
   if (!roomTokens) return;
-  ws = new WebSocket(`${wsBase()}/ws?t=${encodeURIComponent(roomTokens.viewerToken)}`);
+  geracaoConexao++;
+  relayTransport = null;
+  relayFallback = null;
+  relayWtAttempted = false;
+  ws = createTransport({
+    wsUrl: `${wsBase()}/ws?t=${encodeURIComponent(roomTokens.viewerToken)}`,
+    onTransport: ({ transport, fallbackReason, attemptedWebTransport }) => {
+      relayTransport = transport;
+      relayFallback = fallbackReason ?? null;
+      relayWtAttempted = Boolean(attemptedWebTransport);
+      mostrarViaAtiva();
+    },
+  });
   ws.binaryType = 'arraybuffer';
 
   let abriu = false;
@@ -1995,7 +2467,11 @@ function connect() {
       const s = streams.get(view.getUint8(0));
       if (!s) return;
       if (view.getUint8(1) === 3) s.audio?.push(e.data);
-      else s.player.push(e.data);
+      else {
+        s.relayVideoBytes += e.data.byteLength;
+        s.relayUltimoAvanco = performance.now();
+        s.player.push(e.data);
+      }
       return;
     }
 
@@ -2022,7 +2498,7 @@ function connect() {
       $('roomSettings').classList.toggle('on', Boolean(lastRoomState?.locked));
 
       // Limpa o que sumiu sem stream-stop (queda abrupta, por exemplo).
-      const live = new Set((msg.streams ?? []).map((s) => s.slot));
+      const live = new Map((msg.streams ?? []).map((s) => [s.slot, s]));
       for (const s of msg.streams ?? []) {
         const info = available.get(s.slot) ?? { userId: s.userId, config: null };
         info.watchers = s.watchers ?? [];
@@ -2032,14 +2508,30 @@ function connect() {
       }
       for (const slot of [...available.keys()]) if (!live.has(slot)) available.delete(slot);
       for (const slot of [...streams.keys()]) if (!live.has(slot)) closeStream(slot);
-      for (const slot of [...watching]) if (!live.has(slot)) watching.delete(slot);
+      // A intenção morre com a transmissão que a motivou — inclusive quando o
+      // slot voltou ao ar nas mãos de outra pessoa enquanto o socket estava
+      // caído. Só o que sobrevive aos dois testes é reenviado.
+      for (const [slot, alvo] of [...watching]) {
+        if (live.get(slot)?.userId !== alvo.userId) watching.delete(slot);
+      }
+      // O servidor desta conexão nasceu sem saber o que eu assistia; este é o
+      // primeiro `state` dela, então é aqui que a intenção vira pedido de novo.
+      for (const slot of watching.keys()) enviarWatch(slot);
       renderGrid();
       renderBar();
     } else if (msg.type === 'stream-start') {
       // Só anuncia; ninguém assiste até pedir.
       available.set(msg.slot, { userId: msg.userId, fonte: msg.fonte ?? 'tela', config: null });
-      watching.delete(msg.slot);
-      closeStream(msg.slot);
+      const alvo = watching.get(msg.slot);
+      // Durante a reconexão o bootstrap real é state -> stream-start -> state.
+      // O anúncio intermediário não é um unwatch: a intenção só morre se o slot
+      // agora pertence a outra pessoa. Apagá-la aqui fazia o primeiro replay de
+      // watch ser aceito pelo servidor e imediatamente esquecido pelo cliente.
+      if (alvo && alvo.userId === msg.userId) enviarWatch(msg.slot);
+      else {
+        watching.delete(msg.slot);
+        closeStream(msg.slot);
+      }
       renderGrid();
     } else if (msg.type === 'config') {
       const info = available.get(msg.slot);
@@ -2058,6 +2550,22 @@ function connect() {
       // Pode chegar antes de eu pedir para assistir; aí não há o que ligar, e
       // o servidor reenvia assim que o pedido chegar.
       if (watching.has(msg.slot)) startAudio(msg.slot, msg.config);
+    } else if (msg.type === 'quality-state') {
+      const quality = {
+        bitrate: Number(msg.bitrate),
+        fps: Number(msg.fps),
+        degraus: Number(msg.degraus),
+        piso: Boolean(msg.piso),
+      };
+      const info = available.get(msg.slot);
+      if (info) info.quality = quality;
+      const s = streams.get(msg.slot);
+      if (s) {
+        s.qualityTarget = quality;
+        resetQualityMeasurement(s);
+        const selected = streams.get(activeSlot) ?? streams.values().next().value;
+        if (selected === s) mostrarQualityGate(s);
+      }
     } else if (msg.type === 'stream-stop') {
       available.delete(msg.slot);
       watching.delete(msg.slot);
@@ -2091,7 +2599,9 @@ function connect() {
   ws.addEventListener('close', () => {
     closeAllStreams();
     available.clear();
-    watching.clear();
+    // `watching` NÃO é limpo aqui: ele é a intenção de quem assiste, e uma
+    // queda de conexão não é uma desistência. Quem larga a sala de verdade
+    // passa por limparSala(), que zera tudo num lugar só.
     participants = [];
     renderGrid();
 
@@ -2175,13 +2685,14 @@ function abaAberta() {
  * ficam aqui, e não num modal que aparece antes de cada início, porque decidir
  * qualidade toda vez que se quer mostrar a tela é atrito no caminho curto.
  */
-const AJUSTES_PADRAO = { bitrate: 2500000, fps: 30 };
-
 let ajustes = (() => {
   try {
-    return { ...AJUSTES_PADRAO, ...JSON.parse(read('ajustes') ?? '{}') };
+    return normalizeStreamSettings({
+      ...DEFAULT_STREAM_SETTINGS,
+      ...JSON.parse(read('ajustes') ?? '{}'),
+    });
   } catch {
-    return { ...AJUSTES_PADRAO };
+    return { ...DEFAULT_STREAM_SETTINGS };
   }
 })();
 
@@ -2194,10 +2705,38 @@ let ajustes = (() => {
  * querer, e a câmera não leva o microfone porque a voz já anda pela call.
  */
 function opcoesDaFonte() {
-  return {
-    q: String(ajustes.bitrate),
-    fps: String(ajustes.fps),
-  };
+  return streamSettingsToQuery(ajustes);
+}
+
+function marcarOpcaoQualidade(nome, valor) {
+  for (const input of document.querySelectorAll(`input[name="${nome}"]`)) {
+    input.checked = Number(input.value) === Number(valor);
+  }
+}
+
+function abrirAjustesTransmissao() {
+  marcarOpcaoQualidade('streamResolution', ajustes.resolution);
+  marcarOpcaoQualidade('streamFps', ajustes.fps);
+  $('streamQualityModal').hidden = false;
+}
+
+function fecharAjustesTransmissao() {
+  $('streamQualityModal').hidden = true;
+}
+
+function salvarAjustesTransmissao() {
+  ajustes = normalizeStreamSettings({
+    ...ajustes,
+    resolution: document.querySelector('input[name="streamResolution"]:checked')?.value,
+    fps: document.querySelector('input[name="streamFps"]:checked')?.value,
+  });
+  store('ajustes', JSON.stringify(ajustes));
+
+  // Se a captura nasceu dentro da Activity, a troca vale já no próximo
+  // keyframe. A página externa recebe a preferência pela URL na abertura.
+  myBroadcast?.setQuality(ajustes);
+  fecharAjustesTransmissao();
+  toast(`${ajustes.resolution}p · ${ajustes.fps} FPS salvo para a transmissão.`);
 }
 
 /**
@@ -2388,6 +2927,13 @@ $('share').addEventListener('click', () => {
   ligarFonte('tela');
 });
 
+$('shareSettings').addEventListener('click', abrirAjustesTransmissao);
+$('streamQualityCancel').addEventListener('click', fecharAjustesTransmissao);
+$('streamQualitySave').addEventListener('click', salvarAjustesTransmissao);
+$('streamQualityModal').addEventListener('click', (event) => {
+  if (event.target === $('streamQualityModal')) fecharAjustesTransmissao();
+});
+
 $('camera').addEventListener('click', () => {
   if (!session) return;
 
@@ -2453,10 +2999,16 @@ async function broadcastFromHere() {
     apiBase: P,
     bitrate: ajustes.bitrate,
     fps: ajustes.fps,
+    resolution: ajustes.resolution,
     audio: true,
     onAviso: (m) => toast(m, true),
+    // A redução automática vale aqui igual: quem transmite de dentro da
+    // atividade usa o mesmo broadcaster e sofre o mesmo ajuste. Sem isto,
+    // metade dos transmissores veria a imagem piorar sem explicação.
+    onStats: (s) => mostrarQualidadeAutomatica(s),
     onEnd: () => {
       myBroadcast = null;
+      mostrarQualidadeAutomatica({ degraus: 0 });
       renderBar();
     },
   });

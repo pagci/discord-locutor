@@ -8,7 +8,7 @@
          dos cabeçalhos no-store guardou a versão antiga por heurística do
          navegador, e continuaria usando ela para sempre. Trocar a query força
          uma URL nova. Incremente ao publicar mudanças nesses arquivos. -->
-    <link rel="stylesheet" href="/share.css?v=25" />
+    <link rel="stylesheet" href="/share.css?v=26" />
   </head>
   <body>
     <main class="card">
@@ -28,6 +28,14 @@
                começar e para corrigir com a transmissão no ar, que é quando o
                problema costuma aparecer. Vale para a câmera também. -->
           <div class="ajustes">
+            <label>
+              Resolução
+              <select id="resolucao">
+                <option value="480">480p — leve</option>
+                <option value="720">720p — equilibrado</option>
+                <option value="1080">1080p — mais nítido</option>
+              </select>
+            </label>
             <label>
               Qualidade
               <select id="qualidade">
@@ -82,6 +90,7 @@
               <div><strong id="tela-bitrate">—</strong><span>enviando</span></div>
               <div><strong id="tela-elapsed">00:00</strong><span>no ar</span></div>
             </div>
+            <p id="tela-auto" class="status aviso" role="status" hidden></p>
             <button id="somAba" class="secondary" hidden>Som de uma aba ou janela</button>
             <button id="tela-stop" class="danger">Parar de transmitir a tela</button>
           </div>
@@ -125,6 +134,7 @@
               <div><strong id="camera-bitrate">—</strong><span>enviando</span></div>
               <div><strong id="camera-elapsed">00:00</strong><span>no ar</span></div>
             </div>
+            <p id="camera-auto" class="status aviso" role="status" hidden></p>
             <button id="camera-stop" class="danger">Desligar a câmera</button>
           </div>
 
@@ -133,10 +143,13 @@
       </div>
 
       <footer>
-        <p>Mantenha esta aba aberta enquanto transmite. Você pode voltar para o Discord — a transmissão continua.</p>
+        <p>
+          Mantenha esta aba aberta enquanto transmite. Você pode voltar para o Discord — a
+          transmissão continua.
+        </p>
       </footer>
     </main>
 
-    <script type="module" src="/share.js?v=25"></script>
+    <script type="module" src="/share.js?v=26"></script>
   </body>
 </html>

@@ -13,7 +13,14 @@ import prettier from 'eslint-config-prettier';
 import { defineConfig, globalIgnores } from 'eslint/config';
 
 export default defineConfig([
-  globalIgnores(['client/dist/', 'coverage/', '.cache/', 'site/', '.claude/']),
+  globalIgnores([
+    'client/dist/',
+    'coverage/',
+    '.cache/',
+    'site/',
+    '.claude/',
+    'vendor/fails-components-webtransport/lib/',
+  ]),
 
   js.configs.recommended,
 
@@ -36,6 +43,11 @@ export default defineConfig([
     files: ['server/**/*.js', 'scripts/**/*.mjs', 'client/vite.config.js', 'vitest.*.js'],
     ignores: ['server/public/**'],
     languageOptions: { globals: globals.node },
+  },
+
+  {
+    files: ['vendor/fails-components-webtransport/lib/**/*.js'],
+    languageOptions: { globals: { ...globals.node, ...globals.browser } },
   },
 
   {
