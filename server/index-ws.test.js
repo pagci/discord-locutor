@@ -231,9 +231,10 @@ describe('transmissor', () => {
     expect(await ate(espectador, doTipo('config'), 'a config seguinte')).toBeTruthy();
   });
 
-  it('a saída libera o slot e atualiza a sala', async () => {
+  it('a parada explícita libera o slot e atualiza a sala', async () => {
     const { room, transmissor, espectador } = await noAr();
 
+    transmissor.send(JSON.stringify({ type: 'stop' }));
     transmissor.close();
     await ate(espectador, (m) => m.type === 'state' && m.streams.length === 0, 'a sala sem stream');
 
