@@ -1081,6 +1081,14 @@ export function pushChunk(room, entry, chunk) {
   // vale mais que a fila inteira. Admitido o keyframe grande, a mídia seguinte
   // fica bloqueada até drenar pela regra ordinária, sem código a mais.
   const cabeKeyframe = (v) => {
+    // O wire WT aposenta deltas antigos antes de admitir a âncora e reserva um
+    // writer de recuperação. Julgar a fila anterior aqui cria um falso drop:
+    // o próprio keyframe que esvaziaria a lane é recusado, passa a alimentar o
+    // laço de qualidade e derruba uma sessão limpa degrau após degrau.
+    if (v.transport === 'webtransport') {
+      const limiteFisico = tetoKeyframe ?? BOOTSTRAP_BYTES * 2;
+      return bytes <= limiteFisico;
+    }
     if (cabe(v, orcamento * 2)) return true;
     if (tetoKeyframe === null || bytes > tetoKeyframe) return false;
     if (v.bufferedAmount === 0) return true;
@@ -1091,7 +1099,7 @@ export function pushChunk(room, entry, chunk) {
     // esvazia a fila. A excecao vale somente para decoder frio e conserva o teto
     // atomico de tempo; WebSocket continua sem ela porque nao consegue cancelar
     // bytes que ja estao no socket TCP.
-    return v.transport === 'webtransport' && !v.__primed.has(entry.slot);
+    return false;
   };
 
   let sentCopies = 0;

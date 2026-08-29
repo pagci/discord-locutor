@@ -650,6 +650,21 @@ describe('pushChunk', () => {
       }
     });
 
+    it('WebTransport admite keyframe novo mesmo com a lane ja primada', () => {
+      try {
+        const { room, entry, lento } = entupido(650_000, comTaxaConhecida());
+        lento.transport = 'webtransport';
+        lento.__primed.add(entry.slot);
+
+        R.pushChunk(room, entry, quadro(entry.slot, KEYFRAME, 100_000));
+
+        expect(lento.binarios()).toHaveLength(1);
+        expect(entry.droppedChunks).toBe(0);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
     it('WebTransport delega ao wire o teto temporal de deltas e audio', () => {
       try {
         const { room, entry, lento } = entupido(400_000, comTaxaConhecida());
